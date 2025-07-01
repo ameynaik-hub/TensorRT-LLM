@@ -136,14 +136,15 @@ class DeepseekV3MTPHead(nn.Module):
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
 
-    @torch.compile(mode="max-autotune-no-cudagraphs") 
+    @torch.compile(mode="max-autotune-no-cudagraphs")
     def get_last_token_states(self, hidden_states, attn_metadata):
         last_tokens = torch.cumsum(
             attn_metadata.seq_lens_cuda,
-            dim=0, 
+            dim=0,
             dtype=torch.long,
         ) - 1
         return hidden_states[last_tokens]
+
     def forward(self,
                 hidden_states: torch.Tensor,
                 lm_head: Linear,
@@ -151,7 +152,8 @@ class DeepseekV3MTPHead(nn.Module):
                 return_context_logits: bool = False) -> torch.Tensor:
         if not return_context_logits:
             if attn_metadata is not None:
-                hidden_states = self.get_last_token_states(hidden_states, attn_metadata)
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
@@ -926,7 +928,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.hnorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
-        self.fuse_norm_ar = True #FIXME: AMEYN
+        self.fuse_norm_ar = False  #FIXME: AMEYN
         if self.fuse_norm_ar:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
@@ -953,7 +955,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             )
 
         # Print shared head initialization message only for rank 0
-        
+
         self.shared_head = DeepseekV3MTPHead(model_config)
 
     def forward(
@@ -968,7 +970,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def norm_embeds():
-            return self.enorm(embed_tokens(input_ids)) #emdedding 
+            return self.enorm(embed_tokens(input_ids))  #emdedding
 
         def norm_hidden():
             return self.hnorm(hidden_states)
@@ -1001,9 +1003,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             )
         else:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states) 
-
-        
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -1135,7 +1135,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
                 self.epilogue.append(mtp_layer)
-                self.mtp_worker = MTPEagleWorker(model_config.spec_config, model_config)
+                self.mtp_worker = MTPEagleWorker(model_config.spec_config,
+                                                 model_config)
             else:
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
@@ -1145,7 +1146,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 ])
                 self.model.layers.extend(mtp_layers)
                 self.epilogue.extend(mtp_layers)
-                self.mtp_worker = MTPWorker(model_config.spec_config, model_config)
+                self.mtp_worker = MTPWorker(model_config.spec_config,
+                                            model_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []

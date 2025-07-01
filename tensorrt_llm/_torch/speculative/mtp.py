@@ -712,10 +712,13 @@ class MTPWorker(nn.Module):
             mtp_past_tokens_pool.index_copy_(0, slot_ids, new_mtp_past_tokens)
             mtp_past_hidden_states_pool.index_copy_(0, slot_ids,
                                                     new_mtp_past_hidden_states)
-    @torch.compile(mode="max-autotune-no-cudagraphs") 
-    def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules, spec_metadata):
-        topk_value, topk_indices = torch.topk(
-            gen_logprobs, k=self.spec_config.relaxed_topk, dim=-1)
+
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
+                    spec_metadata):
+        topk_value, topk_indices = torch.topk(gen_logprobs,
+                                              k=self.spec_config.relaxed_topk,
+                                              dim=-1)
         topk_indices = topk_indices.reshape(num_gens, mtp_num_modules + 1,
                                             self.spec_config.relaxed_topk)
         topk_value = topk_value.reshape(num_gens, mtp_num_modules + 1,
@@ -724,7 +727,7 @@ class MTPWorker(nn.Module):
             num_gens, mtp_num_modules)
         return topk_value, topk_indices, draft_tokens
 
-    @torch.compile(mode="max-autotune-no-cudagraphs") 
+    @torch.compile(mode="max-autotune-no-cudagraphs")
     def process_generation_logits(self, logits, num_contexts):
         gen_logits = logits[num_contexts:]
         # print(f"AMEYN MTP DBG: gen_logits.shape: {gen_logits.shape}")
@@ -851,8 +854,7 @@ class MTPWorker(nn.Module):
             # print("AMEYN: before process_generation_logits (softmax) logits.shape:", logits.shape)
 
             # generation
-            gen_logprobs = self.process_generation_logits(
-                logits, num_contexts)
+            gen_logprobs = self.process_generation_logits(logits, num_contexts)
             topk_value, topk_indices, draft_tokens = self.topk_kernel(
                 gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
 
@@ -1077,38 +1079,94 @@ class MTPWorker(nn.Module):
             "hidden_states": return_hidden_states,
             "attn_metadata": attn_metadata,
         }
+
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def get_local_max_and_combined(self, logits):
         local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
         # print("AMEYN: 2 local_max_values , local_argmax info inside mtp.py draft_sampler:", local_max_values, local_argmax)
         # Adjust indices based on TP rank and size
         vocab_per_rank = logits.shape[-1]
-        max_index_per_rank = local_argmax.type(torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
         # print("AMEYN: 3 max_index_per_rank info inside mtp.py draft_sampler:", max_index_per_rank)
-        
+
         # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
         # Convert both to float32 to ensure consistent dtype
         max_index_per_rank_float = max_index_per_rank.float()
         local_max_values_float32 = local_max_values.float()
-        
+
         # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
-        combined = torch.stack([max_index_per_rank_float, local_max_values_float32], dim=-1).flatten(-2)
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
         # print("AMEYN: 3.1 combined info inside mtp.py draft_sampler:", combined)
         return combined
-    
+
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def get_local_max_and_combined_16bits(self, logits):
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        # print("AMEYN: 2 local_max_values , local_argmax info inside mtp.py draft_sampler:", local_max_values, local_argmax)
+        # Adjust indices based on TP rank and size
+        logits.shape[-1]
+
+        # Keep both values in 16-bit format
+        max_index_per_rank = local_argmax.type(
+            torch.int16
+        )  # [some number between 0 and vocab_per_rank - 1, for each rank]
+        local_max_values_16bit = local_max_values.type(torch.bfloat16)
+
+        # Pack the 16-bit values directly without converting to float32
+        combined = torch.stack([max_index_per_rank, local_max_values_16bit],
+                               dim=-1).flatten(-2)
+        # print("AMEYN: 3.1 combined info inside mtp.py draft_sampler:", combined)
+        return combined
+
     @torch.compile(mode="max-autotune-no-cudagraphs")
     def get_draft_tokens_from_gathered(self, gathered):
         # print("AMEYN: 3.2 gathered info inside mtp.py get_draft_tokens_from_gathered:", gathered)
         # Since we now use float32 for both indices and values, extract them directly
         # gathered format: [idx0_float, val0_float, idx1_float, val1_float, ...]
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
-        gathered_values_float = gathered[..., 1::2]   # Odd positions: values
-        
+        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
+
         # Find the rank with maximum value
         max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
-        
+
         # Get the corresponding token indices and convert back to int32
-        draft_tokens = torch.gather(gathered_indices_float, -1, max_indices).squeeze(-1).type(torch.int32)
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        # print("AMEYN: 6 draft_tokens info inside mtp.py draft_sampler:", draft_tokens)
+        return draft_tokens
+
+    @torch.compile(mode="max-autotune-no-cudagraphs")
+    def get_draft_tokens_from_gathered_16bits(self, gathered, vocab_per_rank):
+        # print("AMEYN: 3.2 gathered info inside mtp.py get_draft_tokens_from_gathered:", gathered)
+        # Since we now use float32 for both indices and values, extract them directly
+        # gathered format: [idx0_float, val0_float, idx1_float, val1_float, ...]
+        gathered_indices_int32 = gathered[..., 0::2].type(torch.int16).to(
+            torch.int32)
+        # based on the index, add the index * vocab_per_rank to the index to get the global index
+        # Convert local indices to global indices by adding an offset based on rank
+        # For each rank i, add (i * vocab_per_rank) to convert local vocab index to global vocab index
+        # e.g. if vocab_per_rank=1000, rank 0's index 42 -> 42, rank 1's index 42 -> 1042, rank 2's index 42 -> 2042
+        # torch.arange(gathered_indices_int32.shape[-1], device=gathered_indices_int32.device) creates a tensor
+        # containing sequential integers from 0 to (num_ranks-1) on the same device as gathered_indices_int32
+        # e.g. if there are 8 ranks, it creates: tensor([0,1,2,3,4,5,6,7])
+        # This is used to calculate the global vocab index offset for each rank
+        # When multiplied by vocab_per_rank, it gives the starting index for each rank's vocab partition
+        gathered_indices_int32 = gathered_indices_int32 + (
+            torch.arange(gathered_indices_int32.shape[-1],
+                         device=gathered_indices_int32.device) * vocab_per_rank)
+        gathered_values_16bits = gathered[
+            ..., 1::2]  # Odd positions: values already in bfloat16
+        # print("AMEYN: 3.2.1 gathered_values_16bits info inside mtp.py get_draft_tokens_from_gathered:", gathered_values_16bits)
+        # print("AMEYN: 3.2.2 gathered_indices_int32 info inside mtp.py get_draft_tokens_from_gathered:", gathered_indices_int32)
+        # Find the rank with maximum value
+        max_indices = torch.argmax(gathered_values_16bits, dim=-1, keepdim=True)
+
+        # Get the corresponding token indices and convert back to int32
+        draft_tokens = torch.gather(gathered_indices_int32, -1,
+                                    max_indices).squeeze(-1)
         # print("AMEYN: 6 draft_tokens info inside mtp.py draft_sampler:", draft_tokens)
         return draft_tokens
 
@@ -1132,12 +1190,13 @@ class MTPWorker(nn.Module):
         # print("AMEYN: draft_sampler info inside mtp.py draft_sampler:", logits.shape)
         # print("AMEYN: self.model_config.mapping.tp_size:", self.model_config.mapping.tp_size)
         # if False:
-        if (self.model_config is not None and 
-            hasattr(self.model_config, 'mapping') and 
-            self.model_config.mapping.tp_size > 1):
-            combined = self.get_local_max_and_combined(logits)
+        if (self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size > 1):
+            combined = self.get_local_max_and_combined_16bits(logits)
             gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+            draft_tokens = self.get_draft_tokens_from_gathered_16bits(
+                gathered, logits.shape[-1])
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
@@ -1152,9 +1211,10 @@ class MTPEagleWorker(MTPWorker):
         super().__init__(spec_config)
         self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
-    
+
     @torch.compile(mode="max-autotune-no-cudagraphs")
-    def update_draft_tokens(self, next_draft_tokens, new_draft_token, hidden_states, gather_ids, inputs):
+    def update_draft_tokens(self, next_draft_tokens, new_draft_token,
+                            hidden_states, gather_ids, inputs):
         next_draft_tokens.append(new_draft_token)
         # update inputs
         hidden_states = hidden_states[gather_ids]
@@ -1194,8 +1254,9 @@ class MTPEagleWorker(MTPWorker):
             last_tokens_idx = torch.cumsum(
                 attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
             return position_ids, last_tokens_idx
-        
-        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(position_ids, attn_metadata)
+
+        position_ids, last_tokens_idx = prepare_position_ids_and_last_tokens(
+            position_ids, attn_metadata)
         inputs = self.prepare_drafter_inputs(input_ids=input_ids,
                                              position_ids=position_ids,
                                              last_tokens_idx=last_tokens_idx,
@@ -1230,7 +1291,9 @@ class MTPEagleWorker(MTPWorker):
                                                lm_head, attn_metadata, True)
             new_draft_token = self.draft_sampler(logits)
 
-            hidden_states, position_ids = self.update_draft_tokens(next_draft_tokens, new_draft_token, hidden_states, gather_ids, inputs)
+            hidden_states, position_ids = self.update_draft_tokens(
+                next_draft_tokens, new_draft_token, hidden_states, gather_ids,
+                inputs)
             # update attn_metadata
             if i == 0:
                 attn_metadata._seq_lens[:batch_size].fill_(1)
@@ -1259,9 +1322,12 @@ class MTPEagleWorker(MTPWorker):
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                @torch.compile(mode="max-autotune-no-cudagraphs") # FIXME:AN no much improvement.
+
+                @torch.compile(mode="max-autotune-no-cudagraphs"
+                               )  # FIXME:AN no much improvement.
                 def update_kv_lens(kv_lens_cuda, batch_size):
                     kv_lens_cuda[:batch_size] += 1
+
                 update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
             inputs = {
                 "input_ids": new_draft_token,
@@ -1269,7 +1335,6 @@ class MTPEagleWorker(MTPWorker):
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
             }
-        
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
@@ -1278,7 +1343,8 @@ class MTPEagleWorker(MTPWorker):
             attn_metadata.on_update()
 
         @torch.compile(mode="max-autotune-no-cudagraphs")
-        def prepare_next_tokens(next_draft_tokens, accepted_tokens, spec_metadata, batch_size, num_accepted_tokens):
+        def prepare_next_tokens(next_draft_tokens, accepted_tokens,
+                                spec_metadata, batch_size, num_accepted_tokens):
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
             # prepare next new tokens to support overlap scheduler
             next_new_tokens = accepted_tokens[
@@ -1288,7 +1354,9 @@ class MTPEagleWorker(MTPWorker):
                                            dim=1)
             return next_draft_tokens, next_new_tokens
 
-        next_draft_tokens, next_new_tokens = prepare_next_tokens(next_draft_tokens, accepted_tokens, spec_metadata, batch_size, num_accepted_tokens)
+        next_draft_tokens, next_new_tokens = prepare_next_tokens(
+            next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
+            num_accepted_tokens)
 
         return {
             'logits': raw_logits,
