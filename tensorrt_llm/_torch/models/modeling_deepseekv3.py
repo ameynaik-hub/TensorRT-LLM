@@ -276,10 +276,17 @@ class Deepseekv3RoutingImpl():
         self.is_fused = is_fused
 
     def noaux_tc(self, logits, e_score_correction_bias):
+
+        @torch.compile(mode="max-autotune-no-cudagraphs")
+        def _compute_scores(logits, e_score_correction_bias, n_group):
+            scores = F.sigmoid(logits)
+            scores_with_bias = scores + e_score_correction_bias
+            scores_shape = list(scores_with_bias.shape)
+            return scores, scores_with_bias, scores_shape
+
         n_group = self.n_group
-        scores = F.sigmoid(logits)
-        scores_with_bias = scores + e_score_correction_bias
-        scores_shape = list(scores_with_bias.shape)
+        scores, scores_with_bias, scores_shape = _compute_scores(
+            logits, e_score_correction_bias, n_group)
 
         if enable_llm_debug():
             has_nan = torch.isnan(scores_with_bias).any()
@@ -288,6 +295,7 @@ class Deepseekv3RoutingImpl():
                     "Detected NAN in the tensor scores_with_bias. Please check if it matches the expectation."
                 )
 
+        #print("AMEYN: self.is_fused:", self.is_fused)
         if not self.is_fused:
             group_scores = torch.sum(torch.topk(
                 scores_with_bias.view(scores_shape[:-1] +
@@ -694,7 +702,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         """
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
-        moe_backend only supports fp8/fp4 quantization, we need to override
+        moe_backend only supports fp8/fp4 quantization, we need to override #NOTE:AMEYN
         the quant_config for the MTP layer.
         """
         quant_config = model_config.quant_config
@@ -961,6 +969,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         # Print shared head initialization message only for rank 0
 
         self.shared_head = DeepseekV3MTPHead(model_config)
+        # print("MTP : model_config.moe_backend ", model_config.moe_backend)
 
     def forward(
         self,
@@ -1058,6 +1067,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
+        # print("in forward MTP : model_config.moe_backend ", self.model_config.moe_backend)
         return hidden_states
 
 
