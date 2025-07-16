@@ -383,8 +383,12 @@ public:
         // We directly compare the results of AR+AddResidual here, as the accumulation order in NCCL's AR might be
         // inconsistent across different kernels. Therefore, we set atol to 1 (setting it to 0 locally also passes the
         // test).
-        TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
-            kNCCLDataType, ncclSum, m_nccl_comm, 0));
+        
+        if constexpr (!ar_fusion::HasAllGatherOut<Pattern>)
+        {
+            TLLM_NCCL_CHECK(ncclAllReduce(m_allreduce_in.device_data(), ref_output.device_data(), message_size,
+                kNCCLDataType, ncclSum, m_nccl_comm, 0));
+        }
         if constexpr (ar_fusion::HasAllReduceOut<Pattern>)
         {
             TLLM_CHECK(compare<DType>(
@@ -665,6 +669,7 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
         return;
     }
 
+    int iter = 100;
     int token_num = 1;
     int hidden_dim = 8; // Small size for easy output verification
 
@@ -672,14 +677,14 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
 
     if (rank == 0)
     {
-        printf("[AllGather Test] token_num %d, hidden_dim %d, world_size %d\n", token_num, hidden_dim, world_size);
+        printf("[AllGather Test] token_num %d, hidden_dim %d, world_size %d, iter %d\n", token_num, hidden_dim, world_size, iter);
     }
 
     // Set up deterministic input data for each rank
     int message_size = token_num * hidden_dim;
     runner.set_input_data(message_size, [rank](int i) { return static_cast<half>(rank * 100.0f + i); });
 
-    // Print input data from each rank
+    // Print input data from each rank (only once, before iterations)
     comm.barrier(); // Synchronize before printing
     if (rank == 0)
     {
@@ -700,16 +705,19 @@ TEST(Kernel_AllReduceFusion, AllGatherAccuracyAndOutput)
     if (rank == 0)
     {
         printf("==================\n");
+        printf("[Verify] token_num %-4d, hidden_dim %-4d ...", token_num, hidden_dim);
     }
 
-    // Run the AllGather kernel
-    runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+    // Run iterations
+    for (int i = 0; i < iter; ++i)
+    {
+        // runner.reset_io();
+        runner.run_once(&Runner::run_kernel, token_num, hidden_dim);
+        runner.verify(token_num, hidden_dim);
+    }
 
-    // Print the AllGather output
+    // Print the AllGather output (only once, after iterations)
     runner.print_allgather_output(token_num, hidden_dim);
-
-    // Verify accuracy
-    runner.verify(token_num, hidden_dim);
 
     if (rank == 0)
     {
