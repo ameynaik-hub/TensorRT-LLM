@@ -620,8 +620,10 @@ int get_sm_count()
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc, bool TriggerCompletionAtEnd = true>
 void launch_oneshot_lamport(AllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
+    printf("DBG AMEY: launch_oneshot_lamport: launching kernel\n");
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
         allreduce_fusion_kernel_oneshot_lamport<Pattern, DType, NRanks, Fp32Acc, TriggerCompletionAtEnd>, params));
+    printf("DBG AMEY: launch_oneshot_lamport: cudaLaunchKernelEx completed\n");
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
@@ -642,6 +644,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
 {
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
+    printf("DBG AMEY: allreduce_fusion_kernel_launcher: params.size=%d, params.hidden_dim=%d\n", params.size, params.hidden_dim);
     static int SM = tensorrt_llm::common::getSMVersion();
     int token_num = params.size / params.hidden_dim;
     bool oneshot = params.use_oneshot;

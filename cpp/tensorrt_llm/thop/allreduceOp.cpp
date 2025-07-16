@@ -436,6 +436,16 @@ private:
             allreduce_fusion_params.allreduce_out = reduce_out.mutable_data_ptr();
             allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kAllReduce;
         }
+        // Handle AllGather operation
+        else if (mOp == AllReduceFusionOp::ALLGATHER)
+        {
+            // For AllGather, create output tensor with expanded first dimension
+            auto output_shape = input.sizes().vec();
+            output_shape[0] = output_shape[0] * tp_size;  // Expand by group size
+            reduce_out = torch::empty(output_shape, input.options());
+            allreduce_fusion_params.allgather_out = reduce_out.mutable_data_ptr();
+            allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kAllGather;
+        }
         // Handle allreduce fusion here
         // Prepare required output tensors for each fusion pattern
         else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM)
@@ -543,6 +553,7 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE: return {reduce_out};
+        case AllReduceFusionOp::ALLGATHER: return {reduce_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {norm_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
@@ -867,7 +878,7 @@ private:
 
         // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
 
-        // Heurisitic will only be applied on NONE and RESIDUAL_RMS_NORM fusion types.
+        // Heurisitic will only be applied on NONE, ALLGATHER and RESIDUAL_RMS_NORM fusion types.
         // Because NCCL might be faster on some large messageSize cases.
         // Otherwise, MIN_LATENCY strategy will be directly returned due to more fusions it can support.
         // TODO: NCCL AllReduce + subsequent quantization ops (as fallback) can also support the fusion types.
@@ -875,6 +886,7 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE:
+        case AllReduceFusionOp::ALLGATHER:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: break;
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
@@ -885,8 +897,8 @@ private:
         }
 
         // Check mOp to be supported by the heuristic.
-        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
-            "Only NONE and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
+        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::ALLGATHER || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
+            "Only NONE, ALLGATHER and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
 
         // Default to NCCL.
         AllReduceStrategyType strategy = AllReduceStrategyType::NCCL;
