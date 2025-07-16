@@ -878,7 +878,7 @@ private:
 
         // This rule based heuristic only chooses between NCCL and MIN_LATENCY strategies.
 
-        // Heurisitic will only be applied on NONE, ALLGATHER and RESIDUAL_RMS_NORM fusion types.
+        // Heurisitic will only be applied on NONE and RESIDUAL_RMS_NORM fusion types.
         // Because NCCL might be faster on some large messageSize cases.
         // Otherwise, MIN_LATENCY strategy will be directly returned due to more fusions it can support.
         // TODO: NCCL AllReduce + subsequent quantization ops (as fallback) can also support the fusion types.
@@ -886,8 +886,8 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE:
-        case AllReduceFusionOp::ALLGATHER:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: break;
+        case AllReduceFusionOp::ALLGATHER:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
@@ -897,8 +897,8 @@ private:
         }
 
         // Check mOp to be supported by the heuristic.
-        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::ALLGATHER || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
-            "Only NONE, ALLGATHER and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
+        TORCH_CHECK(mOp == AllReduceFusionOp::NONE || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM,
+            "Only NONE and RESIDUAL_RMS_NORM are supported for NCCL/MIN_LATENCY heuristic.");
 
         // Default to NCCL.
         AllReduceStrategyType strategy = AllReduceStrategyType::NCCL;
