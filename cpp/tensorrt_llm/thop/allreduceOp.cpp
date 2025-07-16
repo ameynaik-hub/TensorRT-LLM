@@ -406,6 +406,7 @@ private:
         allreduce_fusion_params.rms_gamma = nullptr;
 
         allreduce_fusion_params.allreduce_out = nullptr;
+        allreduce_fusion_params.allgather_out = nullptr;  // Initialize AllGather output pointer
         allreduce_fusion_params.quant_out = nullptr;
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
@@ -530,7 +531,7 @@ private:
         allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.value().mutable_data_ptr());
         allreduce_fusion_params.allreduce_in = input.data_ptr();
 
-        if (mOp != AllReduceFusionOp::NONE)
+        if (mOp != AllReduceFusionOp::NONE && mOp != AllReduceFusionOp::ALLGATHER)
         {
             allreduce_fusion_params.residual_in = residual.value().data_ptr();
             allreduce_fusion_params.rms_gamma = norm_weight.value().data_ptr();
