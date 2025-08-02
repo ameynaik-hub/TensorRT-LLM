@@ -419,6 +419,7 @@ class MLA(nn.Module):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
+        split_q_gemm: bool = True,
     ):
         """
         Initialize the MLA module.
@@ -441,6 +442,7 @@ class MLA(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
+            split_q_gemm (bool): Whether to split q_b_proj into separate nope and rope gemms. Default is False.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -461,8 +463,17 @@ class MLA(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
+        self.split_q_gemm = split_q_gemm
         if dense_bias is None:
             self.dense_bias = bias
+
+        # Initialize split weight storage for split_q_gemm
+        if self.split_q_gemm:
+            self._split_weights_initialized = False
+            self._q_nope_weight = None
+            self._q_rope_weight = None
+            self._q_nope_bias = None
+            self._q_rope_bias = None
 
         if self.q_lora_rank is None:
             self.q_lora_rank = hidden_size
@@ -520,6 +531,7 @@ class MLA(nn.Module):
                                          eps=rms_norm_eps,
                                          dtype=dtype)
 
+            # Always create the original q_b_proj for weight storage
             self.q_b_proj = Linear(
                 self.q_lora_rank,
                 tp_size * self.num_heads * self.qk_head_dim,
@@ -531,6 +543,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization)
+
+            # For split_q_gemm, we'll split weights dynamically without separate Linear instances
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -542,6 +556,7 @@ class MLA(nn.Module):
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization)
 
+            # Always create the original q_proj for weight storage (lite case)
             self.q_proj = Linear(
                 self.q_lora_rank,
                 tp_size * self.num_heads * self.qk_head_dim,
@@ -554,6 +569,8 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization)
             self.q_b_proj = self.q_proj
+
+            # For split_q_gemm, we'll split weights dynamically without separate Linear instances
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
                                       dtype=dtype,
@@ -659,11 +676,75 @@ class MLA(nn.Module):
         if not config.skip_create_weights_in_init:
             self.create_weights()
 
+    def _initialize_split_weights(self):
+        """
+        Initialize the split weights for split_q_gemm once after the original weights are loaded.
+        This avoids doing the weight splitting on every forward pass.
+        """
+        if not self.split_q_gemm or self._split_weights_initialized:
+            return
+
+        # Check if weights are available yet (they might not be during create_weights phase)
+        if not hasattr(self.q_b_proj, 'weight') or self.q_b_proj.weight is None:
+            print(
+                "DBG: AMEY Split weights not available yet, skipping initialization"
+            )
+            return
+
+        print(
+            f"DBG: AMEY Initializing split weights once - original weight shape: {self.q_b_proj.weight.shape}"
+        )
+
+        # Get the original weight and split it
+        original_weight = self.q_b_proj.weight  # [total_dim, q_lora_rank]
+        total_nope_dim = self.num_heads * self.qk_nope_head_dim
+        total_rope_dim = self.num_heads * self.qk_rope_head_dim
+
+        # Split and store the weight matrices (detach to avoid gradients)
+        self._q_nope_weight = original_weight[:total_nope_dim, :].detach()
+        self._q_rope_weight = original_weight[total_nope_dim:total_nope_dim +
+                                              total_rope_dim, :].detach()
+
+        print(
+            f"  Split weight shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
+        )
+
+        # Split bias if present
+        if self.q_b_proj.bias is not None:
+            self._q_nope_bias = self.q_b_proj.bias[:total_nope_dim].detach()
+            self._q_rope_bias = self.q_b_proj.bias[
+                total_nope_dim:total_nope_dim + total_rope_dim].detach()
+            print(
+                f"  Split bias shapes - nope: {self._q_nope_bias.shape}, rope: {self._q_rope_bias.shape}"
+            )
+        else:
+            self._q_nope_bias = None
+            self._q_rope_bias = None
+
+        self._split_weights_initialized = True
+        print("DBG: AMEY Split weights initialization completed")
+
+    def update_split_weights_if_needed(self):
+        """
+        Public method to update split weights after weight loading.
+        This can be called externally if weights are loaded after module creation.
+        """
+        if self.split_q_gemm and not self._split_weights_initialized:
+            self._initialize_split_weights()
+        elif self.split_q_gemm and self._split_weights_initialized:
+            # Re-initialize if original weights changed
+            print("DBG: AMEY Re-initializing split weights after weight update")
+            self._split_weights_initialized = False
+            self._initialize_split_weights()
+
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
         # which could be modified after __init__
         self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
+
+        # Note: Split weight initialization is skipped here and will happen during first forward pass
+        # when weights are guaranteed to be available
 
         # k_b_proj_trans's dtype must be consistent with self.kv_b_proj,
         # which can be modified after __init__
@@ -784,13 +865,51 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        q, latent_cache = maybe_execute_in_parallel(
-            lambda: self.q_b_proj(q),
-            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        if self.split_q_gemm:
+            # Use pre-computed split weights for efficient computation
+            # Ensure split weights are initialized (fallback if create_weights wasn't called)
+            if not self._split_weights_initialized:
+                self._initialize_split_weights()
+
+            # Execute both GEMMs in parallel using the cached split weights
+            print(f"DBG: AMEY q input shape: {q.shape}")
+            bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
+            print(
+                f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
+            )
+            print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
+
+            def split_gemm_nope():
+                return torch.nn.functional.linear(q, self._q_nope_weight,
+                                                  self._q_nope_bias)
+
+            def split_gemm_rope():
+                return torch.nn.functional.linear(q, self._q_rope_weight,
+                                                  self._q_rope_bias)
+
+            q_nope, q_rope = maybe_execute_in_parallel(
+                split_gemm_nope,  # Wq nope gemm using cached weights
+                split_gemm_rope,  # Wq rope gemm using cached weights
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+            print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
+            print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
+            # Concatenate nope and rope parts
+            q = torch.concat([q_nope, q_rope], dim=-1)
+            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        else:
+            print(
+                f"DBG: AMEY q_b_proj weight shape: {self.q_b_proj.weight.shape}"
+            )
+            q, latent_cache = maybe_execute_in_parallel(
+                lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
+                lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
 
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1213,9 +1332,17 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
+            print(f"DBG: AMEY bmm_out tensor shapes:")
+            print(f"  q_nope_t shape: {q_nope_t.shape}")
+            print(
+                f"  k_b_proj_trans.transpose(1, 2) shape: {self.k_b_proj_trans.transpose(1, 2).shape}"
+            )
+
+            torch.ops.trtllm.bmm_out(
+                q_nope_t,  # Wk^T
+                self.k_b_proj_trans.transpose(1, 2),
+                q_nope_out)
+            print(f"  q_nope_out shape: {q_nope_out.shape}")
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
