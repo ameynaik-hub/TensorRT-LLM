@@ -24,6 +24,60 @@ from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
+# Import llti operations to register them with PyTorch
+try:
+    from llti.ops._C import tk_fused_gemm  # This registers the operations
+    LLTI_AVAILABLE = True
+except ImportError:
+    LLTI_AVAILABLE = False
+    print(
+        "Warning: llti module not available, fused operations will be disabled")
+
+
+def swizzle_b_matrix(B,
+                     weight_block_slice_k_factor=4,
+                     weight_block_slice_k_cols=8):
+    """
+    Swizzles a matrix B into a 4D blocked layout for tk_bmm_fused_matmul.
+
+    Args:
+        B (torch.Tensor): The input matrix of shape (k, n).
+        weight_block_slice_k_factor (int): F_row, the number of rows in a block (default: 4).
+        weight_block_slice_k_cols (int): F_col, the number of columns in a block (default: 8).
+
+    Returns:
+        torch.Tensor: The swizzled matrix.
+    """
+    k, n = B.shape
+    F_row = weight_block_slice_k_factor
+    F_col = weight_block_slice_k_cols
+
+    if k % F_row != 0 or n % F_col != 0:
+        # If dimensions don't align, return original matrix
+        print(
+            f"Warning: Matrix dimensions ({k}, {n}) not compatible with swizzling ({F_row}, {F_col}), using original matrix"
+        )
+        return B
+
+    num_block_rows = k // F_row
+    num_block_cols = n // F_col
+
+    # Create index tensors for vectorized access
+    i0 = torch.arange(num_block_rows, device=B.device)[:, None, None, None]
+    i1 = torch.arange(num_block_cols, device=B.device)[None, :, None, None]
+    i2 = torch.arange(F_row, device=B.device)[None, None, :, None]
+    i3 = torch.arange(F_col, device=B.device)[None, None, None, :]
+
+    # Calculate source indices vectorized
+    src_row = i0 + i2 * num_block_rows
+    src_col = i1 * F_col + i3
+
+    # Gather from source indices in one operation
+    B_swizzled_4d = B[src_row, src_col]
+
+    # Reshape to final layout
+    return B_swizzled_4d.reshape(k, n)
+
 
 class Attention(nn.Module):
 
@@ -474,6 +528,8 @@ class MLA(nn.Module):
             self._q_rope_weight = None
             self._q_nope_bias = None
             self._q_rope_bias = None
+            self._q_nope_weight_swizzled = None  # Pre-swizzled weights for fused operation
+            self._original_q_input = None  # For fused tk_bmm operation
 
         if self.q_lora_rank is None:
             self.q_lora_rank = hidden_size
@@ -709,6 +765,18 @@ class MLA(nn.Module):
             f"  Split weight shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
         )
 
+        # Pre-compute swizzled weights for fused operation
+        if LLTI_AVAILABLE:
+            # Transpose nope weights: [num_heads * qk_nope_head_dim, q_lora_rank] -> [q_lora_rank, num_heads * qk_nope_head_dim]
+            weights_t_raw = self._q_nope_weight.t().contiguous()
+            self._q_nope_weight_swizzled = swizzle_b_matrix(weights_t_raw, 4, 8)
+            print(
+                f"  Swizzled nope weight shape: {self._q_nope_weight_swizzled.shape}"
+            )
+        else:
+            self._q_nope_weight_swizzled = None
+            print("  Skipping swizzled weight creation (LLTI not available)")
+
         # Split bias if present
         if self.q_b_proj.bias is not None:
             self._q_nope_bias = self.q_b_proj.bias[:total_nope_dim].detach()
@@ -735,6 +803,8 @@ class MLA(nn.Module):
             # Re-initialize if original weights changed
             print("DBG: AMEY Re-initializing split weights after weight update")
             self._split_weights_initialized = False
+            # Clear cached swizzled weights
+            self._q_nope_weight_swizzled = None
             self._initialize_split_weights()
 
     def create_weights(self):
@@ -871,31 +941,62 @@ class MLA(nn.Module):
             if not self._split_weights_initialized:
                 self._initialize_split_weights()
 
-            # Execute both GEMMs in parallel using the cached split weights
-            print(f"DBG: AMEY q input shape: {q.shape}")
-            bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
-            print(
-                f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
-            )
-            print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
+            # Check if we should use fused operation (conditions: M=4, num_generations > 0, and LLTI available)
+            num_generations = attn_metadata.num_generations
+            use_fused_tk_bmm = (q.shape[0] == 4 and num_generations > 0
+                                and LLTI_AVAILABLE)
 
-            def split_gemm_nope():
-                return torch.nn.functional.linear(q, self._q_nope_weight,
-                                                  self._q_nope_bias)
+            if use_fused_tk_bmm:
+                print(
+                    f"DBG: AMEY Using fused tk_bmm_fused_matmul - q shape: {q.shape}, num_generations: {num_generations}"
+                )
+                print(f"DBG: AMEY LLTI_AVAILABLE: {LLTI_AVAILABLE}")
+                # Store original q input for later use in fused operation
+                self._original_q_input = q.clone()
 
-            def split_gemm_rope():
-                return torch.nn.functional.linear(q, self._q_rope_weight,
-                                                  self._q_rope_bias)
+                # For now, still compute q_rope normally since we need the full q tensor for context processing
+                def split_gemm_rope():
+                    return torch.nn.functional.linear(q, self._q_rope_weight,
+                                                      self._q_rope_bias)
 
-            q_nope, q_rope = maybe_execute_in_parallel(
-                split_gemm_nope,  # Wq nope gemm using cached weights
-                split_gemm_rope,  # Wq rope gemm using cached weights
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
-            print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
-            print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
+                # Create placeholder for q_nope - will be computed in fused operation
+                q_nope = torch.zeros(q.shape[0],
+                                     self.num_heads * self.qk_nope_head_dim,
+                                     dtype=q.dtype,
+                                     device=q.device)
+                q_rope = split_gemm_rope()
+
+                print(
+                    f"DBG: AMEY Fused mode - q_nope (placeholder) shape: {q_nope.shape}"
+                )
+                print(f"DBG: AMEY Fused mode - q_rope shape: {q_rope.shape}")
+            else:
+                # Execute both GEMMs in parallel using the cached split weights (original path)
+                print(f"DBG: AMEY q input shape: {q.shape}")
+                bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
+                print(
+                    f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
+                )
+                print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
+
+                def split_gemm_nope():
+                    return torch.nn.functional.linear(q, self._q_nope_weight,
+                                                      self._q_nope_bias)
+
+                def split_gemm_rope():
+                    return torch.nn.functional.linear(q, self._q_rope_weight,
+                                                      self._q_rope_bias)
+
+                q_nope, q_rope = maybe_execute_in_parallel(
+                    split_gemm_nope,  # Wq nope gemm using cached weights
+                    split_gemm_rope,  # Wq rope gemm using cached weights
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
+                print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
+                print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
+
             # Concatenate nope and rope parts
             q = torch.concat([q_nope, q_rope], dim=-1)
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
@@ -1323,7 +1424,85 @@ class MLA(nn.Module):
             device=q.device,
         )
 
-        if self.k_b_proj_trans.dtype == torch.bfloat16:
+        # Check if we should use fused tk_bmm operation
+        use_fused_tk_bmm = (hasattr(self, '_original_q_input')
+                            and self._original_q_input is not None
+                            and num_tokens == 4 and LLTI_AVAILABLE)
+
+        if use_fused_tk_bmm:
+            print(
+                f"DBG: AMEY Using fused tk_bmm_fused_matmul in forward_generation"
+            )
+            # Debug: check available operations
+            try:
+                available_ops = dir(torch.ops.llti)
+                print(f"DBG: AMEY Available llti ops: {available_ops}")
+            except:
+                print("DBG: AMEY torch.ops.llti not accessible")
+            # Prepare inputs for fused operation
+            # Input: original q before split (stored in forward_impl)
+            x_input = self._original_q_input  # [4, q_lora_rank]
+
+            # Use pre-computed swizzled weights (computed during initialization)
+            weights_t = self._q_nope_weight_swizzled
+            if weights_t is None:
+                print(
+                    "DBG: AMEY Error: swizzled weights not available, falling back to runtime swizzling"
+                )
+                weights_t_raw = self._q_nope_weight.t().contiguous()
+                weights_t = swizzle_b_matrix(weights_t_raw, 4, 8)
+
+            # BMM weights: k_b_proj_trans.transpose(1, 2)
+            # [num_heads, kv_lora_rank, qk_nope_head_dim] -> [num_heads, qk_nope_head_dim, kv_lora_rank]
+            bmm_weights = self.k_b_proj_trans.transpose(1, 2)
+
+            # Output buffer: [num_heads, num_tokens, kv_lora_rank]
+            fused_output = torch.empty(
+                [self.num_heads, num_tokens, self.kv_lora_rank],
+                dtype=q.dtype,
+                device=q.device)
+
+            print(f"DBG: AMEY Fused operation shapes:")
+            print(f"  x_input shape: {x_input.shape}")
+            print(
+                f"  weights_t shape: {weights_t.shape} (pre-swizzled: {self._q_nope_weight_swizzled is not None})"
+            )
+            print(f"  bmm_weights shape: {bmm_weights.shape}")
+            print(f"  fused_output shape: {fused_output.shape}")
+
+            # Call fused operation: linear(x_input, weights_t) + bmm with bmm_weights
+            try:
+                torch.ops.llti.tk_bmm_fused_matmul(x_input, weights_t,
+                                                   bmm_weights, fused_output)
+                print(
+                    "DBG: AMEY Successfully called torch.ops.llti.tk_bmm_fused_matmul"
+                )
+            except AttributeError as e:
+                print(
+                    f"DBG: AMEY torch.ops.llti.tk_bmm_fused_matmul not found: {e}"
+                )
+                # Try alternative operation names
+                try:
+                    torch.ops.llti.tk_fused_gemm(x_input, weights_t,
+                                                 bmm_weights, fused_output)
+                    print(
+                        "DBG: AMEY Successfully called torch.ops.llti.tk_fused_gemm"
+                    )
+                except Exception as e2:
+                    print(f"DBG: AMEY tk_fused_gemm also failed: {e2}")
+                    raise e  # Re-raise original error
+
+            # Copy result to the correct location in fused_q
+            fused_q[..., :self.kv_lora_rank] = fused_output.transpose(0, 1)
+            print(
+                f"DBG: AMEY Fused operation completed, result shape: {fused_q[..., :self.kv_lora_rank].shape}"
+            )
+
+            # Clean up stored input
+            self._original_q_input = None
+
+        elif self.k_b_proj_trans.dtype == torch.bfloat16:
+            # Original BMM path
             # [num_heads, num_tokens, self.qk_nope_head_dim]
             q_nope_t = q_nope.transpose(0, 1)
             # [num_heads, num_tokens, self.kv_lora_rank]
