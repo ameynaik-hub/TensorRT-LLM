@@ -574,6 +574,7 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
+        self.config = config  # Store config for tp_rank access in debug prints
         tp_size = config.mapping.tp_size
         pp_size = config.mapping.pp_size
         if config.mapping.enable_attention_dp:
@@ -767,18 +768,16 @@ class MLA(nn.Module):
 
         # Check if weights are available yet (they might not be during create_weights phase)
         if not hasattr(self.q_b_proj, 'weight') or self.q_b_proj.weight is None:
-            if self.debug_print:
-                print(
-                    "DBG: AMEY Split weights not available yet, skipping initialization"
-                )
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print("DBG: Split weights not available, skipping init")
             return
 
-        if self.debug_print:
+        if self.debug_print and self.config.mapping.tp_rank == 0:
             print(
-                f"DBG: AMEY Initializing split weights once - original weight shape: {self.q_b_proj.weight.shape}"
+                f"DBG: Init split weights - shape: {self.q_b_proj.weight.shape}"
             )
             print(
-                f"DBG: AMEY self.num_heads: {self.num_heads}, self.qk_nope_head_dim: {self.qk_nope_head_dim}"
+                f"DBG: heads: {self.num_heads}, nope_dim: {self.qk_nope_head_dim}"
             )
 
         # Get the original weight and split it
@@ -798,25 +797,23 @@ class MLA(nn.Module):
         else:
             self._q_nope_weight_swizzled = None
 
-        if self.debug_print:
+        if self.debug_print and self.config.mapping.tp_rank == 0:
             print(
-                f"  Split weight shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
+                f"  Split shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
             )
             if LLTI_AVAILABLE and self._q_nope_weight_swizzled is not None:
-                print(
-                    f"  Swizzled nope weight shape: {self._q_nope_weight_swizzled.shape}"
-                )
+                print(f"  Swizzled shape: {self._q_nope_weight_swizzled.shape}")
             else:
-                print("  Swizzled weights not created (LLTI not available)")
+                print("  Swizzled weights not created (LLTI unavailable)")
 
         # Split bias if present
         if self.q_b_proj.bias is not None:
             self._q_nope_bias = self.q_b_proj.bias[:total_nope_dim].detach()
             self._q_rope_bias = self.q_b_proj.bias[
                 total_nope_dim:total_nope_dim + total_rope_dim].detach()
-            if self.debug_print:
+            if self.debug_print and self.config.mapping.tp_rank == 0:
                 print(
-                    f"  Split bias shapes - nope: {self._q_nope_bias.shape}, rope: {self._q_rope_bias.shape}"
+                    f"  Bias shapes - nope: {self._q_nope_bias.shape}, rope: {self._q_rope_bias.shape}"
                 )
         else:
             self._q_nope_bias = None
@@ -830,20 +827,20 @@ class MLA(nn.Module):
             # - total_nope_dim should be divisible by self.num_heads to get output_per_head
             # - Use test pattern dimensions to ensure kernel compatibility
             output_per_head = total_nope_dim // self.num_heads
-            bmm_output_dim = 512  # Use test pattern value to ensure kernel works
+            # Use actual kv_lora_rank instead of hardcoded value
+            bmm_output_dim = self.kv_lora_rank
 
             # Ensure dimensions make sense
             assert self.num_heads > 0, f"num_heads must be positive, got {self.num_heads}"
             assert total_nope_dim % self.num_heads == 0, f"total_nope_dim ({total_nope_dim}) must be divisible by num_heads ({self.num_heads})"
 
             # Verify we match expected test pattern dimensions
-            expected_shape = [16, 128, 512]
+            expected_shape = [16, 128, bmm_output_dim]
             actual_shape = [self.num_heads, output_per_head, bmm_output_dim]
-            if self.debug_print:
-                print(f"DBG: AMEY BMM weights shape check:")
-                print(f"  Expected pattern: {expected_shape}")
-                print(f"  Actual: {actual_shape}")
-                print(f"  bmm_output_dim: {bmm_output_dim}")
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(
+                    f"DBG: BMM shape check - expected: {expected_shape}, actual: {actual_shape}"
+                )
 
             # Create BMM weights placeholder - will be updated with k_b_proj_trans when available
             # For now, initialize with zeros as placeholder
@@ -853,15 +850,23 @@ class MLA(nn.Module):
                                             dtype=self._q_nope_weight.dtype,
                                             device=self._q_nope_weight.device)
 
-            if self.debug_print:
+            # Create transposed version with layout (65536,128,1) for tk_bmm_fused_matmul
+            self._bmm_weights_transposed = torch.zeros(
+                self.num_heads,
+                bmm_output_dim,
+                output_per_head,
+                dtype=self._q_nope_weight.dtype,
+                device=self._q_nope_weight.device)
+
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: Created BMM weights {self._bmm_weights.shape}")
                 print(
-                    f"DBG: AMEY Created BMM weights placeholder with shape: {self._bmm_weights.shape}"
+                    f"DBG: Created BMM weights transposed {self._bmm_weights_transposed.shape}"
                 )
                 print(
-                    f"DBG: AMEY  num_heads={self.num_heads}, output_per_head={output_per_head}, bmm_output_dim={bmm_output_dim}"
-                )
+                    f"DBG: _bmm_weights strides: {self._bmm_weights.stride()}")
                 print(
-                    f"DBG: AMEY Expected test pattern: [16, 128, 512] vs actual: [{self.num_heads}, {output_per_head}, {bmm_output_dim}]"
+                    f"DBG: _bmm_weights_transposed strides: {self._bmm_weights_transposed.stride()}"
                 )
 
             # BMM output buffer for capturing fused BMM result
@@ -874,25 +879,21 @@ class MLA(nn.Module):
                 device=self._q_nope_weight.device)
         else:
             self._bmm_weights = None
+            self._bmm_weights_transposed = None
             self._bmm_output_buffer = None
 
         # BMM weights will be updated when k_b_proj_trans becomes available
         # in the forward pass when needed
 
         self._split_weights_initialized = True
-        if self.debug_print:
-            print("DBG: AMEY Split weights initialization completed")
-            print(
-                f"  total_nope_dim: {total_nope_dim}, num_heads: {self.num_heads}"
-            )
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print("DBG: Split weights init completed")
             if LLTI_AVAILABLE and self._bmm_weights is not None:
-                print(f"  output_per_head: {total_nope_dim // self.num_heads}")
-                print(f"  BMM weights shape: {self._bmm_weights.shape}")
                 print(
-                    f"  BMM output buffer shape: {self._bmm_output_buffer.shape}"
+                    f"  BMM weights: {self._bmm_weights.shape}, buffer: {self._bmm_output_buffer.shape}"
                 )
             else:
-                print("  BMM weights not created (LLTI not available)")
+                print("  BMM weights not created (LLTI unavailable)")
 
     def _update_bmm_weights_for_generation(self):
         """
@@ -901,21 +902,54 @@ class MLA(nn.Module):
         """
         if (hasattr(self, 'k_b_proj_trans') and self.k_b_proj_trans is not None
                 and not self._bmm_weights_updated):
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: k_b_proj_trans shape: {self.k_b_proj_trans.shape}")
+                print(
+                    f"DBG: Expected: [num_heads={self.num_heads}, kv_lora_rank={self.kv_lora_rank}, qk_nope_head_dim={self.qk_nope_head_dim}]"
+                )
+
             # Reshape k_b_proj_trans to match BMM weights format for fused operation
             # k_b_proj_trans shape: [num_heads, kv_lora_rank, qk_nope_head_dim]
             # Need BMM weights shape: [num_heads, qk_nope_head_dim, kv_lora_rank] (transposed)
             k_b_proj_transposed = self.k_b_proj_trans.transpose(
                 1, 2)  # [num_heads, qk_nope_head_dim, kv_lora_rank]
-            self._bmm_weights = k_b_proj_transposed.clone().detach()
+
+            # Create _bmm_weights with desired stride (65536, 128, 1) using torch.as_strided
+            # Current k_b_proj_transposed has stride (65536, 1, 128)
+            # We want stride (65536, 128, 1) for better kernel performance
+            self._bmm_weights = torch.as_strided(
+                k_b_proj_transposed.contiguous(),
+                size=k_b_proj_transposed.
+                shape,  # Keep same shape [num_heads, qk_nope_head_dim, kv_lora_rank]
+                stride=(
+                    k_b_proj_transposed.shape[1] *
+                    k_b_proj_transposed.shape[2],  # First dim stride
+                    k_b_proj_transposed.
+                    shape[2],  # Second dim stride = kv_lora_rank
+                    1)  # Third dim stride = 1 (contiguous)
+            ).clone().detach()
+
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(
+                    f"DBG: k_b_proj_transposed stride (before as_strided): {k_b_proj_transposed.stride()}"
+                )
+                print(
+                    f"DBG: _bmm_weights stride (after as_strided): {self._bmm_weights.stride()}"
+                )
+                print(
+                    f"DBG: Desired stride pattern: ({self.qk_nope_head_dim * self.kv_lora_rank}, {self.kv_lora_rank}, 1)"
+                )
+
+            # Update the transposed version for tk_bmm_fused_matmul
+            # Original: [num_heads, qk_nope_head_dim, kv_lora_rank]
+            # Transposed: [num_heads, kv_lora_rank, qk_nope_head_dim]
+            self._bmm_weights_transposed = self.k_b_proj_trans.clone().detach()
+
             self._bmm_weights_updated = True
 
-            if self.debug_print:
+            if self.debug_print and self.config.mapping.tp_rank == 0:
                 print(
-                    f"DBG: Updated BMM weights from k_b_proj_trans: {self._bmm_weights.shape}"
-                )
-                print(f"  k_b_proj_trans shape: {self.k_b_proj_trans.shape}")
-                print(
-                    f"  BMM weights (transposed) shape: {self._bmm_weights.shape}"
+                    f"DBG: Updated BMM weights from k_b_proj_trans {self.k_b_proj_trans.shape} -> {self._bmm_weights.shape}"
                 )
 
     def update_split_weights_if_needed(self):
@@ -927,10 +961,8 @@ class MLA(nn.Module):
             self._initialize_split_weights()
         elif self.split_q_gemm and self._split_weights_initialized:
             # Re-initialize if original weights changed
-            if self.debug_print:
-                print(
-                    "DBG: AMEY Re-initializing split weights after weight update"
-                )
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print("DBG: Re-initializing split weights")
             self._split_weights_initialized = False
             self._initialize_split_weights()
 
@@ -1069,22 +1101,10 @@ class MLA(nn.Module):
                 self._initialize_split_weights()
 
             # Execute both GEMMs in parallel using the cached split weights
-            if self.debug_print:
-                print(f"DBG: AMEY q input shape: {q.shape}")
-                bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
+            if self.debug_print and self.config.mapping.tp_rank == 0:
                 print(
-                    f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
+                    f"DBG: q: {q.shape}, nope_weight: {self._q_nope_weight.shape}, LLTI: {LLTI_AVAILABLE}"
                 )
-                if LLTI_AVAILABLE and self._q_nope_weight_swizzled is not None:
-                    print(
-                        f"DBG: AMEY q_nope_weight_swizzled shape: {self._q_nope_weight_swizzled.shape}"
-                    )
-                if LLTI_AVAILABLE and self._dummy_bmm_weights is not None:
-                    print(
-                        f"DBG: AMEY dummy_bmm_weights shape: {self._dummy_bmm_weights.shape}"
-                    )
-                print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
-                print(f"DBG: AMEY LLTI_AVAILABLE: {LLTI_AVAILABLE}")
 
             def split_gemm_nope():
                 # Check if LLTI is available and use fused operation, otherwise fall back to standard linear
@@ -1104,19 +1124,10 @@ class MLA(nn.Module):
                             dtype=q.dtype,
                             device=q.device)
 
-                    if self.debug_print:
+                    if self.debug_print and self.config.mapping.tp_rank == 0:
                         print(
-                            f"DBG: AMEY Calling tk_bmm_fused_matmul with shapes and dtypes:"
-                        )
-                        print(f"  q: {q.shape}, dtype: {q.dtype}")
-                        print(
-                            f"  swizzled_weight: {self._q_nope_weight_swizzled.shape}, dtype: {self._q_nope_weight_swizzled.dtype}"
-                        )
-                        print(
-                            f"  bmm_weights: {self._dummy_bmm_weights.shape}, dtype: {self._dummy_bmm_weights.dtype}"
-                        )
-                        print(
-                            f"  bmm_output: {self._dummy_bmm_output.shape}, dtype: {self._dummy_bmm_output.dtype}"
+                            "================================================START==================================================",
+                            f"DBG: Calling tk_bmm_fused_matmul - q: {q.shape}, batch_size: {q.shape[0]}"
                         )
 
                     # Update BMM weights if needed and capture BMM output for forward_generation reuse
@@ -1127,58 +1138,115 @@ class MLA(nn.Module):
                         self.k_b_proj_trans is not None and
                         self.k_b_proj_trans.dtype == torch.bfloat16)
 
-                    # Debug: Print tensor shapes before calling tk_bmm_fused_matmul
-                    if self.debug_print:  # Always print for debugging
-                        print(f"DBG: tk_bmm_fused_matmul input shapes:")
-                        print(f"  q: {q.shape}, dtype: {q.dtype}")
-                        print(
-                            f"  swizzled_weight: {self._q_nope_weight_swizzled.shape}, dtype: {self._q_nope_weight_swizzled.dtype}"
-                        )
-                        print(
-                            f"  bmm_weights: {self._bmm_weights.shape}, dtype: {self._bmm_weights.dtype}"
-                        )
-                        print(
-                            f"  bmm_output_buffer: {self._bmm_output_buffer.shape}, dtype: {self._bmm_output_buffer.dtype}"
-                        )
-                        if should_capture_bmm and hasattr(
-                                self, 'k_b_proj_trans'):
-                            print(
-                                f"  k_b_proj_trans: {self.k_b_proj_trans.shape}, dtype: {self.k_b_proj_trans.dtype}"
-                            )
-
                     # Update BMM weights to match k_b_proj_trans for the BMM operation
-                    # DISABLED FOR DEBUGGING: if should_capture_bmm:
-                    #     self._update_bmm_weights_for_generation()
+                    if should_capture_bmm:
+                        # Resize BMM output buffer if needed based on current batch size
+                        self._update_bmm_weights_for_generation()
+
+                    # Debug: Print tensor shapes and values before calling tk_bmm_fused_matmul
+                    if self.debug_print and self.config.mapping.tp_rank == 0:
+                        print(
+                            f"DBG: Input shapes - q: {q.shape}, bmm_weights: {self._bmm_weights.shape}, should_capture: {should_capture_bmm}"
+                        )
+                        print(f"DBG: q values (first 10): {q.flatten()[:10]}")
+                        print(f"DBG: q strides: {q.stride()}")
+                        print(
+                            f"DBG: bmm_weights values (first 10): {self._bmm_weights.flatten()[:10]}"
+                        )
+                        print(
+                            f"DBG: bmm_weights shape: {self._bmm_weights.shape}"
+                        )
+                        print(
+                            f"DBG: bmm_weights strides: {self._bmm_weights.stride()}"
+                        )
+                        print(
+                            f"DBG: q stats - mean: {q.mean():.6f}, std: {q.std():.6f}, min: {q.min():.6f}, max: {q.max():.6f}"
+                        )
+                        print(
+                            f"DBG: Expected stride for kernel: ({self.qk_nope_head_dim * self.kv_lora_rank}, {self.kv_lora_rank}, 1)"
+                        )
 
                     intermediate_result, bmm_output = torch.ops.llti.tk_bmm_fused_matmul(
                         q, self._q_nope_weight_swizzled, self._bmm_weights,
                         self._bmm_output_buffer)
+                    if self.debug_print and self.config.mapping.tp_rank == 0:
+                        print(
+                            f"DBG: bmm_output_buffer shape: {self._bmm_output_buffer.shape}"
+                        )
+                        print(
+                            f"DBG: bmm_output_buffer values (first 10): {self._bmm_output_buffer.flatten()[:10]}"
+                        )
+                        print(
+                            f"DBG: bmm_output_buffer stats - mean: {self._bmm_output_buffer.mean():.6f}, std: {self._bmm_output_buffer.std():.6f}, min: {self._bmm_output_buffer.min():.6f}, max: {self._bmm_output_buffer.max():.6f}"
+                        )
+                        print(
+                            f"DBG: intermediate_result strides: {intermediate_result.stride()}"
+                        )
+                        print(f"DBG: bmm_output strides: {bmm_output.stride()}")
+                        print(
+                            f"DBG: self._bmm_output_buffer strides: {self._bmm_output_buffer.stride()}"
+                        )
+                        print(
+                            f"DBG: bmm_output_buffer shape: {self._bmm_output_buffer.shape}"
+                        )
+                        print(
+                            f"DBG: bmm_output_buffer values (first 10): {self._bmm_output_buffer.flatten()[:10]}"
+                        )
+                        print(
+                            f"DBG: bmm_output_buffer stats - mean: {self._bmm_output_buffer.mean():.6f}, std: {self._bmm_output_buffer.std():.6f}, min: {self._bmm_output_buffer.min():.6f}, max: {self._bmm_output_buffer.max():.6f}"
+                        )
 
                     # Cache BMM output for forward_generation if conditions are met
                     if should_capture_bmm:
                         self._cached_bmm_output = bmm_output.clone().detach()
-                        if self.debug_print:
+                        if self.debug_print and self.config.mapping.tp_rank == 0:
                             print(
-                                f"DBG: Cached BMM output for generation: {self._cached_bmm_output.shape}"
+                                f"DBG: Cached BMM output: {self._cached_bmm_output.shape}"
+                            )
+                            print(
+                                f"DBG: cached_bmm_output values (first 10): {self._cached_bmm_output.flatten()[:10]}"
+                            )
+                            print(
+                                f"DBG: cached_bmm_output stats - mean: {self._cached_bmm_output.mean():.6f}, std: {self._cached_bmm_output.std():.6f} min: {self._cached_bmm_output.min():.6f}, max: {self._cached_bmm_output.max():.6f}"
+                            )
+                            print(
+                                f"DBG: cached_bmm_output strides: {self._cached_bmm_output.stride()}"
                             )
                     else:
                         self._cached_bmm_output = None
 
-                    if self.debug_print:
+                    if self.debug_print and self.config.mapping.tp_rank == 0:
                         print(
-                            f"DBG: AMEY tk_bmm_fused_matmul completed successfully, result: {intermediate_result.shape}"
+                            f"DBG: tk_bmm_fused_matmul completed, intermediate_result shape: {intermediate_result.shape}"
+                        )
+                        print(
+                            f"DBG: intermediate_result values (first 10): {intermediate_result.flatten()[:10]}"
+                        )
+                        print(
+                            f"DBG: intermediate_result stats - mean: {intermediate_result.mean():.6f}, std: {intermediate_result.std():.6f}, min: {intermediate_result.min():.6f}, max: {intermediate_result.max():.6f}"
+                        )
+                        print(
+                            f"DBG: bmm_output values shape and values (first 10): {bmm_output.shape}, {bmm_output.flatten()[:10]}"
+                        )
+                        print(
+                            f"DBG: bmm_output stats - mean: {bmm_output.mean():.6f}, std: {bmm_output.std():.6f}, min: {bmm_output.min():.6f}, max: {bmm_output.max():.6f}"
                         )
 
                     # Add bias if present
                     if self._q_nope_bias is not None:
                         intermediate_result = intermediate_result + self._q_nope_bias
 
+                    if self.debug_print and self.config.mapping.tp_rank == 0 and self._q_nope_bias is not None:
+                        print(
+                            f"DBG: q_nope_bias: {self._q_nope_bias.shape}, {self._q_nope_bias.flatten()[:10]}"
+                        )
+
                     return intermediate_result
                 else:
                     # Fall back to standard linear operation
-                    if self.debug_print:  # Always print for debugging
+                    if self.debug_print and self.config.mapping.tp_rank == 0:
                         print(
-                            f"DBG: AMEY Falling back to torch.nn.functional.linear (batch_size={q.shape[0]}, LLTI_AVAILABLE={LLTI_AVAILABLE})"
+                            f"DBG: Fallback to linear (batch_size={q.shape[0]}, LLTI={LLTI_AVAILABLE})"
                         )
                     return torch.nn.functional.linear(q, self._q_nope_weight,
                                                       self._q_nope_bias)
@@ -1194,17 +1262,14 @@ class MLA(nn.Module):
                 self.ln_events[1],
                 self.aux_stream,
             )
-            if self.debug_print:
-                print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
-                print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: q_nope: {q_nope.shape}, q_rope: {q_rope.shape}")
             # Concatenate nope and rope parts
             q = torch.concat([q_nope, q_rope], dim=-1)
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
-            if self.debug_print:
-                print(
-                    f"DBG: AMEY q_b_proj weight shape: {self.q_b_proj.weight.shape}"
-                )
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: q_b_proj weight: {self.q_b_proj.weight.shape}")
             q, latent_cache = maybe_execute_in_parallel(
                 lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
                 lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -1628,6 +1693,13 @@ class MLA(nn.Module):
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: GENERATION - q_nope_out: {q_nope_out.shape}")
+                print(
+                    f"DBG: GENERATION - q_nope_out strides: {q_nope_out.stride()}"
+                )
+                print(f"DBG: GENERATION - fused_q: {fused_q.shape}")
+                print(f"DBG: GENERATION - fused_q strides: {fused_q.stride()}")
 
             # FUSED BMM GENERATION: Use cached BMM output if available from tk_bmm_fused_matmul
             use_cached_bmm = (
@@ -1638,26 +1710,44 @@ class MLA(nn.Module):
 
             if use_cached_bmm:
                 # Use BMM output from tk_bmm_fused_matmul in forward_impl
-                if self.debug_print:
+                if self.debug_print and self.config.mapping.tp_rank == 0:
                     print(
-                        f"DBG: GENERATION - Using cached BMM output from tk_bmm_fused_matmul"
+                        f"DBG: GENERATION - Using cached BMM {self._cached_bmm_output.shape} -> {q_nope_out.shape}"
                     )
-                    print(
-                        f"  cached_bmm_output shape: {self._cached_bmm_output.shape}"
-                    )
-                    print(f"  q_nope_out shape: {q_nope_out.shape}")
 
                 # Copy cached BMM result to q_nope_out
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: GENERATION - self._cached_bmm_output: {self._cached_bmm_output.shape}"
+                    )
+                    print(
+                        f"DBG: GENERATION - self._cached_bmm_output values (first 10): {self._cached_bmm_output.flatten()[:10]}"
+                    )
+                    print(
+                        f"DBG: GENERATION - self._cached_bmm_output stats - mean: {self._cached_bmm_output.mean():.6f}, std: {self._cached_bmm_output.std():.6f}, min: {self._cached_bmm_output.min():.6f}, max: {self._cached_bmm_output.max():.6f}"
+                    )
+                    print(
+                        f"DBG: GENERATION - self._cached_bmm_output strides: {self._cached_bmm_output.stride()}"
+                    )
                 q_nope_out.copy_(self._cached_bmm_output)
-
-                if self.debug_print:
-                    print(f"  Successfully used cached BMM output")
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: GENERATION - q_nope_out: {q_nope_out.shape}")
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: GENERATION - q_nope_out: {q_nope_out.shape}")
+                    print(
+                        f"DBG: GENERATION - q_nope_out values (first 10): {q_nope_out.flatten()[:10]}"
+                    )
+                    print(
+                        f"DBG: GENERATION - q_nope_out stats - mean: {q_nope_out.mean():.6f}, std: {q_nope_out.std():.6f}, min: {q_nope_out.min():.6f}, max: {q_nope_out.max():.6f}"
+                    )
+                    print(
+                        f"DBG: GENERATION - q_nope_out strides: {q_nope_out.stride()}"
+                    )
             else:
                 # Standard BMM path: Use torch.nn.functional.linear + torch.ops.trtllm.bmm_out
-                if self.debug_print:
-                    print(f"DBG: GENERATION - Using standard bmm_out")
+                if self.debug_print and self.config.mapping.tp_rank == 0:
                     print(
-                        f"  num_tokens: {num_tokens}, cached_bmm available: {self._cached_bmm_output is not None}"
+                        f"DBG: GENERATION - Using standard bmm_out (tokens={num_tokens}, cached={self._cached_bmm_output is not None})"
                     )
 
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
@@ -1666,19 +1756,45 @@ class MLA(nn.Module):
                 # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
                 # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
                 # The output of bmm is written directly into fused_q
-                if self.debug_print:
-                    print(f"  q_nope_t shape: {q_nope_t.shape}")
+                if self.debug_print and self.config.mapping.tp_rank == 0:
                     print(
-                        f"  k_b_proj_trans.transpose(1, 2) shape: {self.k_b_proj_trans.transpose(1, 2).shape}"
+                        f"  q_nope_t: {q_nope_t.shape}, k_b_proj_trans.T: {self.k_b_proj_trans.transpose(1, 2).shape}"
+                    )
+                    print(
+                        f"DBG: GENERATION - k_b_proj_trans.T values (first 10): {self.k_b_proj_trans.transpose(1, 2).flatten()[:10]}"
+                    )
+                    print(
+                        f"DBG: GENERATION - k_b_proj_trans.T stats - mean: {self.k_b_proj_trans.transpose(1, 2).mean():.6f}, std: {self.k_b_proj_trans.transpose(1, 2).std():.6f}, min: {self.k_b_proj_trans.transpose(1, 2).min():.6f}, max: {self.k_b_proj_trans.transpose(1, 2).max():.6f}"
                     )
 
+                    print("weight strides: ",
+                          self.k_b_proj_trans.transpose(1, 2).stride())
                 torch.ops.trtllm.bmm_out(
                     q_nope_t,  # Wk^T
                     self.k_b_proj_trans.transpose(1, 2),
                     q_nope_out)
 
-                if self.debug_print:
-                    print(f"  q_nope_out shape: {q_nope_out.shape}")
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: GENERATION IN - q_nope_t: {q_nope_t.shape}")
+                    print(
+                        f"DBG: GENERATION IN - q_nope_t values (first 10): {q_nope_t.flatten()[:10]}"
+                    )
+                    print(
+                        f"DBG: GENERATION IN - q_nope_t stats - mean: {q_nope_t.mean():.6f}, std: {q_nope_t.std():.6f}, min: {q_nope_t.min():.6f}, max: {q_nope_t.max():.6f}"
+                    )
+                    print(
+                        f"DBG: GENERATION IN - q_nope_t strides: {q_nope_t.stride()}"
+                    )
+                    print(f"DBG: GENERATION - q_nope_out: {q_nope_out.shape}")
+                    print(
+                        f"DBG: GENERATION - q_nope_out values (first 10): {q_nope_out.flatten()[:10]}"
+                    )
+                    print(
+                        f"DBG: GENERATION - q_nope_out stats - mean: {q_nope_out.mean():.6f}, std: {q_nope_out.std():.6f}, min: {q_nope_out.min():.6f}, max: {q_nope_out.max():.6f}"
+                    )
+                    print(
+                        f"DBG: GENERATION - q_nope_out strides: {q_nope_out.stride()}"
+                    )
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -1693,6 +1809,18 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
+
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print(
+                f"DBG: GENERATION - before applying rotary: fused_q.shape: {fused_q.shape}"
+            )
+            print(f"DBG: fused_q values (first 10): {fused_q.flatten()[:10]}")
+            print(
+                f"DBG: fused_q stats - mean: {fused_q.mean():.6f}, std: {fused_q.std():.6f}, min: {fused_q.min():.6f}, max: {fused_q.max():.6f}"
+            )
+            print(
+                "================================================END=================================================="
+            )
 
         if self.apply_rotary_emb:
             fused_q[..., self.kv_lora_rank:] = q_pe
