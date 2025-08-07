@@ -5,6 +5,15 @@ from typing import Optional, Union, cast
 import torch
 from torch import nn
 
+# Import llti operations to register them with PyTorch
+try:
+    from llti.ops._C import tk_fused_gemm  # This registers the operations
+    LLTI_AVAILABLE = True
+except ImportError:
+    LLTI_AVAILABLE = False
+    print(
+        "Warning: llti module not available, fused operations will be disabled")
+
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -23,6 +32,63 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
+
+
+def swizzle_b_matrix(B, weight_block_slice_k_factor, weight_block_slice_k_cols):
+    """
+    Swizzles a matrix B into a 4D blocked layout.
+
+    The original matrix B of shape (k, n) is conceptually transformed into a
+    4D tensor of shape (k/F_row, n/F_col, F_row, F_col) and then
+    flattened to a 1D array.
+
+    The mapping is:
+    Dest[block_row, block_col, row_in_block, col_in_block] = B[
+        block_row + row_in_block * (k / F_row),
+        block_col * F_col + col_in_block
+    ]
+
+    Args:
+        B (torch.Tensor): The input matrix of shape (k, n).
+        weight_block_slice_k_factor (int): F_row, the number of rows in a block.
+        weight_block_slice_k_cols (int): F_col, the number of columns in a block.
+
+    Returns:
+        torch.Tensor: The swizzled matrix, flattened to a 2D array
+                     of shape (k/F_row, n*F_row).
+    """
+    k, n = B.shape
+
+    F_row = weight_block_slice_k_factor
+    F_col = weight_block_slice_k_cols
+
+    if k % F_row != 0:
+        raise ValueError(
+            "k must be divisible by weight_block_slice_k_factor (F_row)")
+    if n % F_col != 0:
+        raise ValueError(
+            "n must be divisible by weight_block_slice_k_cols (F_col)")
+
+    num_block_rows = k // F_row
+    num_block_cols = n // F_col
+
+    # Create index tensors for vectorized access
+    i0 = torch.arange(num_block_rows, device=B.device)[:, None, None, None]
+    i1 = torch.arange(num_block_cols, device=B.device)[None, :, None, None]
+    i2 = torch.arange(F_row, device=B.device)[None, None, :, None]
+    i3 = torch.arange(F_col, device=B.device)[None, None, None, :]
+
+    # Calculate source indices vectorized
+    src_row = i0 + i2 * num_block_rows
+    src_col = i1 * F_col + i3
+
+    # Gather from source indices in one operation
+    B_swizzled_4d = B[src_row, src_col]
+
+    # The C++ code stores this 4D tensor linearly, which is equivalent
+    # to reshaping it to 2D for easier use.
+    # The final physical layout is (k/F_row) x (n*F_row).
+    return B_swizzled_4d.reshape(k, n)
 
 
 class Attention(nn.Module):
@@ -420,6 +486,7 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         split_q_gemm: bool = True,
+        debug_print: bool = False,
     ):
         """
         Initialize the MLA module.
@@ -443,6 +510,7 @@ class MLA(nn.Module):
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
             split_q_gemm (bool): Whether to split q_b_proj into separate nope and rope gemms. Default is False.
+            debug_print (bool): Whether to enable debug print statements. Default is False.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -464,6 +532,7 @@ class MLA(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.split_q_gemm = split_q_gemm
+        self.debug_print = debug_print
         if dense_bias is None:
             self.dense_bias = bias
 
@@ -474,6 +543,10 @@ class MLA(nn.Module):
             self._q_rope_weight = None
             self._q_nope_bias = None
             self._q_rope_bias = None
+            # Additional storage for swizzled weights for tk_bmm_fused_matmul
+            self._q_nope_weight_swizzled = None
+            self._dummy_bmm_weights = None
+            self._dummy_bmm_output = None
 
         if self.q_lora_rank is None:
             self.q_lora_rank = hidden_size
@@ -686,14 +759,19 @@ class MLA(nn.Module):
 
         # Check if weights are available yet (they might not be during create_weights phase)
         if not hasattr(self.q_b_proj, 'weight') or self.q_b_proj.weight is None:
-            print(
-                "DBG: AMEY Split weights not available yet, skipping initialization"
-            )
+            if self.debug_print:
+                print(
+                    "DBG: AMEY Split weights not available yet, skipping initialization"
+                )
             return
 
-        print(
-            f"DBG: AMEY Initializing split weights once - original weight shape: {self.q_b_proj.weight.shape}"
-        )
+        if self.debug_print:
+            print(
+                f"DBG: AMEY Initializing split weights once - original weight shape: {self.q_b_proj.weight.shape}"
+            )
+            print(
+                f"DBG: AMEY self.num_heads: {self.num_heads}, self.qk_nope_head_dim: {self.qk_nope_head_dim}"
+            )
 
         # Get the original weight and split it
         original_weight = self.q_b_proj.weight  # [total_dim, q_lora_rank]
@@ -705,24 +783,105 @@ class MLA(nn.Module):
         self._q_rope_weight = original_weight[total_nope_dim:total_nope_dim +
                                               total_rope_dim, :].detach()
 
-        print(
-            f"  Split weight shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
-        )
+        # Create swizzled weight for tk_bmm_fused_matmul only if LLTI is available
+        if LLTI_AVAILABLE:
+            self._q_nope_weight_swizzled = swizzle_b_matrix(
+                self._q_nope_weight.t().contiguous(), 4, 8).detach()
+        else:
+            self._q_nope_weight_swizzled = None
+
+        if self.debug_print:
+            print(
+                f"  Split weight shapes - nope: {self._q_nope_weight.shape}, rope: {self._q_rope_weight.shape}"
+            )
+            if LLTI_AVAILABLE and self._q_nope_weight_swizzled is not None:
+                print(
+                    f"  Swizzled nope weight shape: {self._q_nope_weight_swizzled.shape}"
+                )
+            else:
+                print("  Swizzled weights not created (LLTI not available)")
 
         # Split bias if present
         if self.q_b_proj.bias is not None:
             self._q_nope_bias = self.q_b_proj.bias[:total_nope_dim].detach()
             self._q_rope_bias = self.q_b_proj.bias[
                 total_nope_dim:total_nope_dim + total_rope_dim].detach()
-            print(
-                f"  Split bias shapes - nope: {self._q_nope_bias.shape}, rope: {self._q_rope_bias.shape}"
-            )
+            if self.debug_print:
+                print(
+                    f"  Split bias shapes - nope: {self._q_nope_bias.shape}, rope: {self._q_rope_bias.shape}"
+                )
         else:
             self._q_nope_bias = None
             self._q_rope_bias = None
 
+        # Create dummy BMM weights and output buffer for tk_bmm_fused_matmul only if LLTI is available
+        if LLTI_AVAILABLE:
+            # We need appropriate shapes but the values don't matter since we only use the matmul result
+            # The BMM weights shape needs to match expected format: (n_heads, output_per_head, bmm_n)
+            # Based on tk_bmm_fused_matmul expectations and test file patterns:
+            # - total_nope_dim should be divisible by self.num_heads to get output_per_head
+            # - Use BMM dimension that matches test pattern exactly
+            output_per_head = total_nope_dim // self.num_heads
+            dummy_bmm_n = 512  # Match the exact test pattern (test uses bmmN = 512)
+
+            # Ensure dimensions make sense
+            assert self.num_heads > 0, f"num_heads must be positive, got {self.num_heads}"
+            assert total_nope_dim % self.num_heads == 0, f"total_nope_dim ({total_nope_dim}) must be divisible by num_heads ({self.num_heads})"
+
+            # Verify we match the expected test pattern
+            expected_shape = [16, 128, 512]
+            actual_shape = [self.num_heads, output_per_head, dummy_bmm_n]
+            if self.debug_print:
+                print(f"DBG: AMEY BMM weights shape check:")
+                print(f"  Expected (from test): {expected_shape}")
+                print(f"  Actual: {actual_shape}")
+                print(f"  Matches: {actual_shape == expected_shape}")
+
+            self._dummy_bmm_weights = torch.zeros(
+                self.num_heads,
+                output_per_head,
+                dummy_bmm_n,
+                dtype=self._q_nope_weight.dtype,
+                device=self._q_nope_weight.device)
+
+            if self.debug_print:
+                print(
+                    f"DBG: AMEY Created dummy BMM weights with shape: {self._dummy_bmm_weights.shape}"
+                )
+                print(
+                    f"DBG: AMEY  num_heads={self.num_heads}, output_per_head={output_per_head}, dummy_bmm_n={dummy_bmm_n}"
+                )
+                print(
+                    f"DBG: AMEY Expected pattern: [16, 128, 512] vs actual: [{self.num_heads}, {output_per_head}, {dummy_bmm_n}]"
+                )
+
+            # Dummy output buffer for BMM result (we won't use this)
+            # Shape should be [num_heads, batch_size, bmm_n] - batch_size will be updated dynamically
+            self._dummy_bmm_output = torch.empty(
+                self.num_heads,
+                1,
+                dummy_bmm_n,  # batch_size=1 initially, will be resized as needed
+                dtype=self._q_nope_weight.dtype,
+                device=self._q_nope_weight.device)
+        else:
+            self._dummy_bmm_weights = None
+            self._dummy_bmm_output = None
+
         self._split_weights_initialized = True
-        print("DBG: AMEY Split weights initialization completed")
+        if self.debug_print:
+            print("DBG: AMEY Split weights initialization completed")
+            print(
+                f"  total_nope_dim: {total_nope_dim}, num_heads: {self.num_heads}"
+            )
+            if LLTI_AVAILABLE and self._dummy_bmm_weights is not None:
+                print(f"  output_per_head: {total_nope_dim // self.num_heads}")
+                print(
+                    f"  Dummy BMM weights shape: {self._dummy_bmm_weights.shape}"
+                )
+                print(
+                    f"  Dummy BMM output shape: {self._dummy_bmm_output.shape}")
+            else:
+                print("  Dummy BMM weights not created (LLTI not available)")
 
     def update_split_weights_if_needed(self):
         """
@@ -733,7 +892,10 @@ class MLA(nn.Module):
             self._initialize_split_weights()
         elif self.split_q_gemm and self._split_weights_initialized:
             # Re-initialize if original weights changed
-            print("DBG: AMEY Re-initializing split weights after weight update")
+            if self.debug_print:
+                print(
+                    "DBG: AMEY Re-initializing split weights after weight update"
+                )
             self._split_weights_initialized = False
             self._initialize_split_weights()
 
@@ -872,16 +1034,78 @@ class MLA(nn.Module):
                 self._initialize_split_weights()
 
             # Execute both GEMMs in parallel using the cached split weights
-            print(f"DBG: AMEY q input shape: {q.shape}")
-            bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
-            print(
-                f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
-            )
-            print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
+            if self.debug_print:
+                print(f"DBG: AMEY q input shape: {q.shape}")
+                bias_shape = self._q_nope_bias.shape if self._q_nope_bias is not None else "None"
+                print(
+                    f"DBG: AMEY q_nope_weight shape: {self._q_nope_weight.shape} bias: {bias_shape}"
+                )
+                if LLTI_AVAILABLE and self._q_nope_weight_swizzled is not None:
+                    print(
+                        f"DBG: AMEY q_nope_weight_swizzled shape: {self._q_nope_weight_swizzled.shape}"
+                    )
+                if LLTI_AVAILABLE and self._dummy_bmm_weights is not None:
+                    print(
+                        f"DBG: AMEY dummy_bmm_weights shape: {self._dummy_bmm_weights.shape}"
+                    )
+                print(f"DBG: AMEY value of bias: {self._q_nope_bias}")
+                print(f"DBG: AMEY LLTI_AVAILABLE: {LLTI_AVAILABLE}")
 
             def split_gemm_nope():
-                return torch.nn.functional.linear(q, self._q_nope_weight,
-                                                  self._q_nope_bias)
+                # Check if LLTI is available and use fused operation, otherwise fall back to standard linear
+                if LLTI_AVAILABLE and hasattr(torch.ops, 'llti') and hasattr(
+                        torch.ops.llti,
+                        'tk_bmm_fused_matmul') and q.shape[0] == 4:
+                    # Use tk_bmm_fused_matmul for the matrix multiplication
+                    # We only use the intermediate_result (matmul result), not the BMM output
+
+                    # Resize dummy BMM output buffer if needed based on current batch size
+                    current_batch_size = q.shape[0]
+                    if self._dummy_bmm_output.shape[1] != current_batch_size:
+                        self._dummy_bmm_output = torch.empty(
+                            self._dummy_bmm_weights.shape[0],
+                            current_batch_size,
+                            self._dummy_bmm_weights.shape[2],
+                            dtype=q.dtype,
+                            device=q.device)
+
+                    if self.debug_print:
+                        print(
+                            f"DBG: AMEY Calling tk_bmm_fused_matmul with shapes and dtypes:"
+                        )
+                        print(f"  q: {q.shape}, dtype: {q.dtype}")
+                        print(
+                            f"  swizzled_weight: {self._q_nope_weight_swizzled.shape}, dtype: {self._q_nope_weight_swizzled.dtype}"
+                        )
+                        print(
+                            f"  bmm_weights: {self._dummy_bmm_weights.shape}, dtype: {self._dummy_bmm_weights.dtype}"
+                        )
+                        print(
+                            f"  bmm_output: {self._dummy_bmm_output.shape}, dtype: {self._dummy_bmm_output.dtype}"
+                        )
+
+                    intermediate_result, _ = torch.ops.llti.tk_bmm_fused_matmul(
+                        q, self._q_nope_weight_swizzled,
+                        self._dummy_bmm_weights, self._dummy_bmm_output)
+
+                    if self.debug_print:
+                        print(
+                            f"DBG: AMEY tk_bmm_fused_matmul completed successfully, result: {intermediate_result.shape}"
+                        )
+
+                    # Add bias if present
+                    if self._q_nope_bias is not None:
+                        intermediate_result = intermediate_result + self._q_nope_bias
+
+                    return intermediate_result
+                else:
+                    # Fall back to standard linear operation
+                    if self.debug_print:
+                        print(
+                            "DBG: AMEY Falling back to torch.nn.functional.linear (LLTI not available)"
+                        )
+                    return torch.nn.functional.linear(q, self._q_nope_weight,
+                                                      self._q_nope_bias)
 
             def split_gemm_rope():
                 return torch.nn.functional.linear(q, self._q_rope_weight,
@@ -894,15 +1118,17 @@ class MLA(nn.Module):
                 self.ln_events[1],
                 self.aux_stream,
             )
-            print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
-            print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
+            if self.debug_print:
+                print(f"DBG: AMEY q_nope shape: {q_nope.shape}")
+                print(f"DBG: AMEY q_rope shape: {q_rope.shape}")
             # Concatenate nope and rope parts
             q = torch.concat([q_nope, q_rope], dim=-1)
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
-            print(
-                f"DBG: AMEY q_b_proj weight shape: {self.q_b_proj.weight.shape}"
-            )
+            if self.debug_print:
+                print(
+                    f"DBG: AMEY q_b_proj weight shape: {self.q_b_proj.weight.shape}"
+                )
             q, latent_cache = maybe_execute_in_parallel(
                 lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
                 lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -1332,17 +1558,19 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            print(f"DBG: AMEY bmm_out tensor shapes:")
-            print(f"  q_nope_t shape: {q_nope_t.shape}")
-            print(
-                f"  k_b_proj_trans.transpose(1, 2) shape: {self.k_b_proj_trans.transpose(1, 2).shape}"
-            )
+            if self.debug_print:
+                print(f"DBG: AMEY bmm_out tensor shapes:")
+                print(f"  q_nope_t shape: {q_nope_t.shape}")
+                print(
+                    f"  k_b_proj_trans.transpose(1, 2) shape: {self.k_b_proj_trans.transpose(1, 2).shape}"
+                )
 
             torch.ops.trtllm.bmm_out(
                 q_nope_t,  # Wk^T
                 self.k_b_proj_trans.transpose(1, 2),
                 q_nope_out)
-            print(f"  q_nope_out shape: {q_nope_out.shape}")
+            if self.debug_print:
+                print(f"  q_nope_out shape: {q_nope_out.shape}")
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
