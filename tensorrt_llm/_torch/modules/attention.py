@@ -1179,6 +1179,7 @@ class MLA(nn.Module):
                 self._initialize_split_weights()
 
             def split_gemm_nope():
+                self._update_bmm_weights_for_generation()
                 # DEBUG: Print before fused operation attempt
                 if self.debug_print and self.config.mapping.tp_rank == 0:
                     print(
@@ -1218,14 +1219,39 @@ class MLA(nn.Module):
                                 f"DBG: Calling tk_bmm_fused_matmul - q.shape: {q.shape}, weights shape: {self._q_nope_weight_swizzled.shape}"
                             )
 
-                        intermediate_result, _ = torch.ops.llti.tk_bmm_fused_matmul(
+                        intermediate_result, bmm_out1 = torch.ops.llti.tk_bmm_fused_matmul(
                             q, self._q_nope_weight_swizzled, self._bmm_weights,
                             self._bmm_output_buffer)
 
-                        if self.debug_print and self.config.mapping.tp_rank == 0:
+                        if False and self.debug_print and self.config.mapping.tp_rank == 0:
                             print(
                                 f"DBG: tk_bmm_fused_matmul SUCCESS - result shape: {intermediate_result.shape}"
                             )
+                            print("self._bmm_output_buffer shape and strides: ",
+                                  self._bmm_output_buffer.shape,
+                                  self._bmm_output_buffer.stride())
+                            print("self._bmm_output_buffer: ",
+                                  self._bmm_output_buffer[:16, 0, 0])
+                            print("self._bmm_output_buffer: ",
+                                  self._bmm_output_buffer[0, :16, 0])
+                            print("self._bmm_output_buffer: ",
+                                  self._bmm_output_buffer[0, 0, :16])
+                            print("bmm_out1 shape and strides: ",
+                                  bmm_out1.shape, bmm_out1.stride())
+                            print("bmm_out1: ", bmm_out1[:16, 0, 0])
+                            print("bmm_out1: ", bmm_out1[0, :16, 0])
+                            print("bmm_out1: ", bmm_out1[0, 0, :16])
+                            print("_bmm_weights shape and strides: ",
+                                  self._bmm_weights.shape,
+                                  self._bmm_weights.stride())
+                            print("_bmm_weights: ", self._bmm_weights[:16, 0,
+                                                                      0])
+                            print("_bmm_weights: ", self._bmm_weights[0, :16,
+                                                                      0])
+                            print("_bmm_weights: ", self._bmm_weights[0,
+                                                                      0, :16])
+
+                        self._cached_bmm_output = bmm_out1.clone().detach()
 
                         return intermediate_result
 
@@ -1275,7 +1301,7 @@ class MLA(nn.Module):
                 if self.debug_print and self.config.mapping.tp_rank == 0:
                     print(f"DBG: Split GEMMs FAILED - Error: {e}")
                 raise
-
+            '''
             bmm_output = torch.empty(
                 [self.num_heads, q.shape[0], self.kv_lora_rank],
                 dtype=q.dtype,
@@ -1298,7 +1324,13 @@ class MLA(nn.Module):
 
             if should_capture_bmm:
                 self._cached_bmm_output = bmm_output.clone().detach()
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print("self._cached_bmm_output shape and strides: ", self._cached_bmm_output.shape, self._cached_bmm_output.stride())
+                    print("self._cached_bmm_output: ", self._cached_bmm_output[:16,0,0])
+                    print("self._cached_bmm_output: ", self._cached_bmm_output[0,:16,0])
+                    print("self._cached_bmm_output: ", self._cached_bmm_output[0,0,:16])
             # Concatenate nope and rope parts
+            '''
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
             if self.debug_print and self.config.mapping.tp_rank == 0:
