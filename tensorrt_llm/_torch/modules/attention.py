@@ -9,7 +9,7 @@ from torch import nn
 
 # Import llti operations to register them with PyTorch
 try:
-    from llti.ops._C import tk_fused_gemm  # This registers the operations
+    import llti.ops._C  # This registers the operations
     LLTI_AVAILABLE = True
 except ImportError:
     LLTI_AVAILABLE = False
@@ -488,7 +488,6 @@ class MLA(nn.Module):
             dense_bias: Optional[bool] = None,
             config: Optional[ModelConfig] = None,
             split_q_gemm: bool = True,
-            debug_print: bool = False,
             use_fused_bmm_for_generation:
         bool = True,  # Use BMM output from tk_bmm_fused_matmul for forward_generation
     ):
@@ -514,7 +513,6 @@ class MLA(nn.Module):
             dense_bias (bool): Whether to use bias in the output projection layer.
             config (ModelConfig): The model configuration.
             split_q_gemm (bool): Whether to split q_b_proj into separate nope and rope gemms. Default is False.
-            debug_print (bool): Whether to enable debug print statements. Default is False.
             use_fused_bmm_for_generation (bool): Use BMM output from tk_bmm_fused_matmul for forward_generation BMM. Default is True.
         """
         super().__init__()
@@ -537,7 +535,6 @@ class MLA(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.split_q_gemm = split_q_gemm
-        self.debug_print = debug_print
         self.use_fused_bmm_for_generation = use_fused_bmm_for_generation
         if dense_bias is None:
             self.dense_bias = bias
@@ -858,11 +855,7 @@ class MLA(nn.Module):
 
         # Create dummy BMM weights and output buffer for tk_bmm_fused_matmul only if LLTI is available
         if LLTI_AVAILABLE:
-            # We need appropriate shapes but the values don't matter since we only use the matmul result
-            # The BMM weights shape needs to match expected format: (n_heads, output_per_head, bmm_n)
-            # Based on tk_bmm_fused_matmul expectations and test file patterns:
-            # - total_nope_dim should be divisible by self.num_heads to get output_per_head
-            # - Use test pattern dimensions to ensure kernel compatibility
+
             output_per_head = total_nope_dim // self.num_heads
             # Use actual kv_lora_rank instead of hardcoded value
             bmm_output_dim = self.kv_lora_rank
@@ -872,8 +865,6 @@ class MLA(nn.Module):
             assert total_nope_dim % self.num_heads == 0, f"total_nope_dim ({total_nope_dim}) must be divisible by num_heads ({self.num_heads})"
 
             # Verify we match expected test pattern dimensions
-            [16, 128, bmm_output_dim]
-            [self.num_heads, output_per_head, bmm_output_dim]
 
             # Create BMM weights placeholder - will be updated with k_b_proj_trans when available
             # For now, initialize with zeros as placeholder
@@ -882,14 +873,6 @@ class MLA(nn.Module):
                                             bmm_output_dim,
                                             dtype=self._q_nope_weight.dtype,
                                             device=self._q_nope_weight.device)
-
-            # Create transposed version with layout (65536,128,1) for tk_bmm_fused_matmul
-            self._bmm_weights_transposed = torch.zeros(
-                self.num_heads,
-                bmm_output_dim,
-                output_per_head,
-                dtype=self._q_nope_weight.dtype,
-                device=self._q_nope_weight.device)
 
             # BMM output buffer for capturing fused BMM result
             # Shape should be [num_heads, batch_size, bmm_output_dim] - batch_size will be updated dynamically
@@ -901,11 +884,7 @@ class MLA(nn.Module):
                 device=self._q_nope_weight.device)
         else:
             self._bmm_weights = None
-            self._bmm_weights_transposed = None
             self._bmm_output_buffer = None
-
-        # BMM weights will be updated when k_b_proj_trans becomes available
-        # in the forward pass when needed
 
         self._split_weights_initialized = True
 
@@ -938,24 +917,7 @@ class MLA(nn.Module):
                     1)  # Third dim stride = 1 (contiguous)
             ).clone().detach()
 
-            # Update the transposed version for tk_bmm_fused_matmul
-            # Original: [num_heads, qk_nope_head_dim, kv_lora_rank]
-            # Transposed: [num_heads, kv_lora_rank, qk_nope_head_dim]
-            self._bmm_weights_transposed = self.k_b_proj_trans.clone().detach()
-
             self._bmm_weights_updated = True
-
-    def update_split_weights_if_needed(self):
-        """
-        Public method to update split weights after weight loading.
-        This can be called externally if weights are loaded after module creation.
-        """
-        if self.split_q_gemm and not self._split_weights_initialized:
-            self._initialize_split_weights()
-        elif self.split_q_gemm and self._split_weights_initialized:
-            # Re-initialize if original weights changed
-            self._split_weights_initialized = False
-            self._initialize_split_weights()
 
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
@@ -1066,87 +1028,16 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        # DEBUG: Print entry info
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(
-                f"DBG: forward_impl entry - hidden_states.shape: {hidden_states.shape}, device: {hidden_states.device}"
-            )
-            print(
-                f"DBG: forward_impl entry - is_lite: {self.is_lite}, split_q_gemm: {self.split_q_gemm}"
-            )
-
         if self.is_lite:
-            # DEBUG: Print before kv_a_proj_with_mqa call
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: About to call kv_a_proj_with_mqa (lite mode) - input shape: {hidden_states.shape}"
-                )
-
-            try:
-                compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                    hidden_states).split(
-                        [self.kv_lora_rank, self.qk_rope_head_dim], -1)
-
-                # DEBUG: Success in lite mode
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: kv_a_proj_with_mqa (lite) SUCCESS - compressed_kv.shape: {compressed_kv.shape}, k_pe.shape: {k_pe.shape}"
-                    )
-
-            except Exception as e:
-                # DEBUG: Error in lite mode
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: kv_a_proj_with_mqa (lite) FAILED - Error: {e}")
-                    print(
-                        f"DBG: kv_a_proj_with_mqa details - hidden_size: {self.hidden_size}"
-                    )
-                    print(
-                        f"DBG: kv_a_proj_with_mqa details - kv_lora_rank: {self.kv_lora_rank}, qk_rope_head_dim: {self.qk_rope_head_dim}"
-                    )
-                raise
-
+            compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
-            # DEBUG: Print before kv_a_proj_with_mqa call
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: About to call kv_a_proj_with_mqa (non-lite mode) - input shape: {hidden_states.shape}"
-                )
-                print(
-                    f"DBG: Expected split sizes - q_lora_rank: {self.q_lora_rank}, kv_lora_rank: {self.kv_lora_rank}, qk_rope_head_dim: {self.qk_rope_head_dim}"
-                )
-
-            try:
-                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                    hidden_states).split([
-                        self.q_lora_rank, self.kv_lora_rank,
-                        self.qk_rope_head_dim
-                    ], -1)
-
-                # DEBUG: Success in non-lite mode
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: kv_a_proj_with_mqa (non-lite) SUCCESS - q.shape: {q.shape}, compressed_kv.shape: {compressed_kv.shape}, k_pe.shape: {k_pe.shape}"
-                    )
-
-            except Exception as e:
-                # DEBUG: Error in non-lite mode
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: kv_a_proj_with_mqa (non-lite) FAILED - Error: {e}"
-                    )
-                    print(
-                        f"DBG: kv_a_proj_with_mqa details - hidden_size: {self.hidden_size}"
-                    )
-                    print(
-                        f"DBG: Expected output size: {self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim}"
-                    )
-                    if hasattr(self.kv_a_proj_with_mqa, 'out_features'):
-                        print(
-                            f"DBG: Actual kv_a_proj_with_mqa out_features: {self.kv_a_proj_with_mqa.out_features}"
-                        )
-                raise
+            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                ], -1)
 
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),
@@ -1156,55 +1047,21 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        # DEBUG: Print after successful kv_a_proj_with_mqa
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(f"DBG: Post kv_a_proj_with_mqa - q.shape: {q.shape}")
-            print(
-                f"DBG: Checking split_q_gemm path - q.shape[0]: {q.shape[0]}, split_q_gemm: {self.split_q_gemm}"
-            )
-
-        if q.shape[0] == 4 and self.split_q_gemm:
-            # DEBUG: Print entering split GEMM path
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(f"DBG: Entering split_q_gemm path")
-                print(
-                    f"DBG: _split_weights_initialized: {self._split_weights_initialized}"
-                )
-
-            # Use pre-computed split weights for efficient computation
-            # Ensure split weights are initialized (fallback if create_weights wasn't called)
+        if q.shape[0] == 4 and self.split_q_gemm:  #ONLY FOR M dim 4
             if not self._split_weights_initialized:
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: Initializing split weights")
                 self._initialize_split_weights()
 
             def split_gemm_nope():
                 self._update_bmm_weights_for_generation()
-                # DEBUG: Print before fused operation attempt
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: split_gemm_nope - LLTI_AVAILABLE: {LLTI_AVAILABLE}"
-                    )
-                    print(f"DBG: split_gemm_nope - q.shape: {q.shape}")
-                    if LLTI_AVAILABLE:
-                        print(
-                            f"DBG: split_gemm_nope - attempting tk_bmm_fused_matmul"
-                        )
 
                 # Check if LLTI is available and use fused operation, otherwise fall back to standard linear
                 if LLTI_AVAILABLE and hasattr(torch.ops, 'llti') and hasattr(
                         torch.ops.llti,
                         'tk_bmm_fused_matmul') and q.shape[0] == 4:
-                    # Use tk_bmm_fused_matmul for the matrix multiplication
-                    # We only use the intermediate_result (matmul result), not the BMM output
 
                     # Resize BMM output buffer if needed based on current batch size
                     current_batch_size = q.shape[0]
                     if self._bmm_output_buffer.shape[1] != current_batch_size:
-                        if self.debug_print and self.config.mapping.tp_rank == 0:
-                            print(
-                                f"DBG: Resizing BMM output buffer from {self._bmm_output_buffer.shape} to match batch size {current_batch_size}"
-                            )
                         self._bmm_output_buffer = torch.empty(
                             self._bmm_weights.shape[0],
                             current_batch_size,
@@ -1212,77 +1069,24 @@ class MLA(nn.Module):
                             dtype=q.dtype,
                             device=q.device)
 
-                    # Update BMM weights if needed and capture BMM output for forward_generation reuse
-                    try:
-                        if self.debug_print and self.config.mapping.tp_rank == 0:
-                            print(
-                                f"DBG: Calling tk_bmm_fused_matmul - q.shape: {q.shape}, weights shape: {self._q_nope_weight_swizzled.shape}"
-                            )
+                    intermediate_result, bmm_out1 = torch.ops.llti.tk_bmm_fused_matmul(
+                        q, self._q_nope_weight_swizzled, self._bmm_weights,
+                        self._bmm_output_buffer)
 
-                        intermediate_result, bmm_out1 = torch.ops.llti.tk_bmm_fused_matmul(
-                            q, self._q_nope_weight_swizzled, self._bmm_weights,
-                            self._bmm_output_buffer)
+                    self._cached_bmm_output = bmm_out1.clone().detach()
 
-                        if False and self.debug_print and self.config.mapping.tp_rank == 0:
-                            print(
-                                f"DBG: tk_bmm_fused_matmul SUCCESS - result shape: {intermediate_result.shape}"
-                            )
-                            print("self._bmm_output_buffer shape and strides: ",
-                                  self._bmm_output_buffer.shape,
-                                  self._bmm_output_buffer.stride())
-                            print("self._bmm_output_buffer: ",
-                                  self._bmm_output_buffer[:16, 0, 0])
-                            print("self._bmm_output_buffer: ",
-                                  self._bmm_output_buffer[0, :16, 0])
-                            print("self._bmm_output_buffer: ",
-                                  self._bmm_output_buffer[0, 0, :16])
-                            print("bmm_out1 shape and strides: ",
-                                  bmm_out1.shape, bmm_out1.stride())
-                            print("bmm_out1: ", bmm_out1[:16, 0, 0])
-                            print("bmm_out1: ", bmm_out1[0, :16, 0])
-                            print("bmm_out1: ", bmm_out1[0, 0, :16])
-                            print("_bmm_weights shape and strides: ",
-                                  self._bmm_weights.shape,
-                                  self._bmm_weights.stride())
-                            print("_bmm_weights: ", self._bmm_weights[:16, 0,
-                                                                      0])
-                            print("_bmm_weights: ", self._bmm_weights[0, :16,
-                                                                      0])
-                            print("_bmm_weights: ", self._bmm_weights[0,
-                                                                      0, :16])
-
-                        self._cached_bmm_output = bmm_out1.clone().detach()
-
-                        return intermediate_result
-
-                    except Exception as e:
-                        if self.debug_print and self.config.mapping.tp_rank == 0:
-                            print(
-                                f"DBG: tk_bmm_fused_matmul FAILED - Error: {e}")
-                            print(f"DBG: Falling back to standard linear")
-                        # Fall back to standard linear operation
-                        return torch.nn.functional.linear(
-                            q, self._q_mixed_nope_weight, self._q_nope_bias)
+                    return intermediate_result
 
                 else:
-                    if self.debug_print and self.config.mapping.tp_rank == 0:
-                        print(
-                            f"DBG: Using standard linear operation (LLTI not available or conditions not met)"
-                        )
-                    # Fall back to standard linear operation
                     return torch.nn.functional.linear(q,
                                                       self._q_mixed_nope_weight,
                                                       self._q_nope_bias)
 
             def split_gemm_rope():
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: split_gemm_rope - using standard linear")
                 return torch.nn.functional.linear(q, self._q_mixed_rope_weight,
                                                   self._q_rope_bias)
 
             try:
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: About to execute split GEMMs in parallel")
 
                 q_nope_mixed, q_rope_mixed = maybe_execute_in_parallel(
                     split_gemm_nope,  # Wq nope gemm using optimized mixed weights
@@ -1292,49 +1096,11 @@ class MLA(nn.Module):
                     self.aux_stream,
                 )
 
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: Split GEMMs SUCCESS - q_nope_mixed.shape: {q_nope_mixed.shape}, q_rope_mixed.shape: {q_rope_mixed.shape}"
-                    )
-
-            except Exception as e:
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: Split GEMMs FAILED - Error: {e}")
+            except Exception:
                 raise
-            '''
-            bmm_output = torch.empty(
-                [self.num_heads, q.shape[0], self.kv_lora_rank],
-                dtype=q.dtype,
-                device=q.device,
-            )
 
-            should_capture_bmm = (
-                self.use_fused_bmm_for_generation and q.shape[0] == 4
-                and  # Only when batch size is 4
-                hasattr(self, 'k_b_proj_trans') and self.k_b_proj_trans
-                is not None and self.k_b_proj_trans.dtype == torch.bfloat16)
-
-            q_nope_t = q_nope_mixed.view(q_nope_mixed.shape[0], self.num_heads,
-                                         self.qk_nope_head_dim).transpose(0, 1)
-
-            torch.ops.trtllm.bmm_out(
-                q_nope_t,  # Wk^T
-                self.k_b_proj_trans.transpose(1, 2),
-                bmm_output)
-
-            if should_capture_bmm:
-                self._cached_bmm_output = bmm_output.clone().detach()
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print("self._cached_bmm_output shape and strides: ", self._cached_bmm_output.shape, self._cached_bmm_output.stride())
-                    print("self._cached_bmm_output: ", self._cached_bmm_output[:16,0,0])
-                    print("self._cached_bmm_output: ", self._cached_bmm_output[0,:16,0])
-                    print("self._cached_bmm_output: ", self._cached_bmm_output[0,0,:16])
-            # Concatenate nope and rope parts
-            '''
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(f"DBG: Using standard q_b_proj path")
 
             q, latent_cache = maybe_execute_in_parallel(
                 lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
@@ -1352,16 +1118,10 @@ class MLA(nn.Module):
 
         if q.shape[
                 0] == 4 and self.split_q_gemm and self.use_fused_bmm_for_generation:
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(f"DBG: skipping assert q.shape[0] == num_tokens")
+            pass
         else:
             assert q.shape[
                 0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
-
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(
-                f"DBG: num_contexts: {num_contexts}, num_generations: {num_generations}, num_ctx_tokens: {num_ctx_tokens}, num_tokens: {num_tokens}"
-            )
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -1757,9 +1517,6 @@ class MLA(nn.Module):
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         num_tokens = q.shape[0]
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(f"DBG: q.shape: {q.shape}")
-            print(f"DBG: num_tokens: {num_tokens}")
 
         if not (q.shape[0] == 4 and self.split_q_gemm
                 and self.use_fused_bmm_for_generation):
@@ -1791,13 +1548,7 @@ class MLA(nn.Module):
             )
 
             if use_cached_bmm:
-                # Use BMM output from tk_bmm_fused_matmul in forward_impl
 
-                # Copy cached BMM result to q_nope_out
-                # Instead of copying to the view, write directly to the underlying fused_q tensor
-                # self._cached_bmm_output shape: [num_heads, num_tokens, kv_lora_rank]
-                # fused_q[..., :kv_lora_rank] shape: [num_tokens, num_heads, kv_lora_rank]
-                # We need to transpose the cached output to match fused_q layout
                 fused_q[..., :self.
                         kv_lora_rank] = self._cached_bmm_output.transpose(0, 1)
 
@@ -1806,10 +1557,6 @@ class MLA(nn.Module):
 
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
-
-                # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
-                # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
-                # The output of bmm is written directly into fused_q
 
                 torch.ops.trtllm.bmm_out(
                     q_nope_t,  # Wk^T
