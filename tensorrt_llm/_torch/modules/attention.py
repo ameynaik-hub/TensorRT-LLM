@@ -488,7 +488,7 @@ class MLA(nn.Module):
             dense_bias: Optional[bool] = None,
             config: Optional[ModelConfig] = None,
             split_q_gemm: bool = True,
-            debug_print: bool = True,
+            debug_print: bool = False,
             use_fused_bmm_for_generation:
         bool = True,  # Use BMM output from tk_bmm_fused_matmul for forward_generation
     ):
@@ -656,8 +656,6 @@ class MLA(nn.Module):
                 force_dynamic_quantization=config.force_dynamic_quantization)
             self.q_b_proj = self.q_proj
 
-            # For split_q_gemm, we'll split weights dynamically without separate Linear instances
-
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
                                       dtype=dtype,
                                       eps=rms_norm_eps)
@@ -776,9 +774,6 @@ class MLA(nn.Module):
 
         # Get the original weight and split it
         original_weight = self.q_b_proj.weight  # [total_dim, q_lora_rank]
-        print(
-            f"DBG: original_weight shape: {original_weight.shape} stride: {original_weight.stride()}"
-        )
         total_nope_dim = self.num_heads * self.qk_nope_head_dim
         total_rope_dim = self.num_heads * self.qk_rope_head_dim
 
@@ -788,19 +783,6 @@ class MLA(nn.Module):
                                               total_rope_dim, :].detach()
         # Create optimized mixed nope weight that directly produces the concat->view->split result
         # This eliminates the need for concat->view->split operations entirely
-        print(
-            f"DBG: Creating optimized mixed_nope_weight for layer {self.layer_idx}"
-        )
-        print(
-            f"DBG: Original _q_nope_weight shape: {self._q_nope_weight.shape}")
-        print(
-            f"DBG: Original _q_rope_weight shape: {self._q_rope_weight.shape}")
-        print(
-            f"DBG: num_heads: {self.num_heads}, qk_nope_head_dim: {self.qk_nope_head_dim}, qk_rope_head_dim: {self.qk_rope_head_dim}"
-        )
-        print(
-            f"DBG: total_nope_dim: {total_nope_dim}, total_rope_dim: {total_rope_dim}"
-        )
         mixed_nope_weight = torch.zeros_like(self._q_nope_weight)
 
         for head in range(self.num_heads):
@@ -829,9 +811,6 @@ class MLA(nn.Module):
         self._q_mixed_nope_weight = mixed_nope_weight.detach()
 
         # Create optimized mixed rope weight that directly produces the rope concat->view->split result
-        print(
-            f"DBG: Creating optimized mixed_rope_weight for layer {self.layer_idx}"
-        )
         mixed_rope_weight = torch.zeros_like(self._q_rope_weight)
 
         for head in range(self.num_heads):
@@ -944,11 +923,6 @@ class MLA(nn.Module):
             k_b_proj_transposed = self.k_b_proj_trans.transpose(
                 1, 2)  # [num_heads, qk_nope_head_dim, kv_lora_rank]
 
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: k_b_proj_trans stride: {self.k_b_proj_trans.stride()} and shape: {self.k_b_proj_trans.shape} k_b_proj_transposed stride: {k_b_proj_transposed.stride()} and shape: {k_b_proj_transposed.shape}"
-                )
-
             # Create _bmm_weights with desired stride (65536, 128, 1) using torch.as_strided
             # Current k_b_proj_transposed has stride (65536, 1, 128)
             # We want stride (65536, 128, 1) for better kernel performance
@@ -963,11 +937,6 @@ class MLA(nn.Module):
                     shape[2],  # Second dim stride = kv_lora_rank
                     1)  # Third dim stride = 1 (contiguous)
             ).clone().detach()
-
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: _bmm_weights stride (after as_strided): {self._bmm_weights.stride()}"
-                )
 
             # Update the transposed version for tk_bmm_fused_matmul
             # Original: [num_heads, qk_nope_head_dim, kv_lora_rank]
@@ -1097,16 +1066,87 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        # DEBUG: Print entry info
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print(
+                f"DBG: forward_impl entry - hidden_states.shape: {hidden_states.shape}, device: {hidden_states.device}"
+            )
+            print(
+                f"DBG: forward_impl entry - is_lite: {self.is_lite}, split_q_gemm: {self.split_q_gemm}"
+            )
+
         if self.is_lite:
-            compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+            # DEBUG: Print before kv_a_proj_with_mqa call
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(
+                    f"DBG: About to call kv_a_proj_with_mqa (lite mode) - input shape: {hidden_states.shape}"
+                )
+
+            try:
+                compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                    hidden_states).split(
+                        [self.kv_lora_rank, self.qk_rope_head_dim], -1)
+
+                # DEBUG: Success in lite mode
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: kv_a_proj_with_mqa (lite) SUCCESS - compressed_kv.shape: {compressed_kv.shape}, k_pe.shape: {k_pe.shape}"
+                    )
+
+            except Exception as e:
+                # DEBUG: Error in lite mode
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: kv_a_proj_with_mqa (lite) FAILED - Error: {e}")
+                    print(
+                        f"DBG: kv_a_proj_with_mqa details - hidden_size: {self.hidden_size}"
+                    )
+                    print(
+                        f"DBG: kv_a_proj_with_mqa details - kv_lora_rank: {self.kv_lora_rank}, qk_rope_head_dim: {self.qk_rope_head_dim}"
+                    )
+                raise
+
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
-            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
-                hidden_states).split([
-                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
-                ], -1)
+            # DEBUG: Print before kv_a_proj_with_mqa call
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(
+                    f"DBG: About to call kv_a_proj_with_mqa (non-lite mode) - input shape: {hidden_states.shape}"
+                )
+                print(
+                    f"DBG: Expected split sizes - q_lora_rank: {self.q_lora_rank}, kv_lora_rank: {self.kv_lora_rank}, qk_rope_head_dim: {self.qk_rope_head_dim}"
+                )
+
+            try:
+                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                    hidden_states).split([
+                        self.q_lora_rank, self.kv_lora_rank,
+                        self.qk_rope_head_dim
+                    ], -1)
+
+                # DEBUG: Success in non-lite mode
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: kv_a_proj_with_mqa (non-lite) SUCCESS - q.shape: {q.shape}, compressed_kv.shape: {compressed_kv.shape}, k_pe.shape: {k_pe.shape}"
+                    )
+
+            except Exception as e:
+                # DEBUG: Error in non-lite mode
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: kv_a_proj_with_mqa (non-lite) FAILED - Error: {e}"
+                    )
+                    print(
+                        f"DBG: kv_a_proj_with_mqa details - hidden_size: {self.hidden_size}"
+                    )
+                    print(
+                        f"DBG: Expected output size: {self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim}"
+                    )
+                    if hasattr(self.kv_a_proj_with_mqa, 'out_features'):
+                        print(
+                            f"DBG: Actual kv_a_proj_with_mqa out_features: {self.kv_a_proj_with_mqa.out_features}"
+                        )
+                raise
 
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),
@@ -1116,13 +1156,40 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
-        if self.split_q_gemm:
+        # DEBUG: Print after successful kv_a_proj_with_mqa
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print(f"DBG: Post kv_a_proj_with_mqa - q.shape: {q.shape}")
+            print(
+                f"DBG: Checking split_q_gemm path - q.shape[0]: {q.shape[0]}, split_q_gemm: {self.split_q_gemm}"
+            )
+
+        if q.shape[0] == 4 and self.split_q_gemm:
+            # DEBUG: Print entering split GEMM path
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: Entering split_q_gemm path")
+                print(
+                    f"DBG: _split_weights_initialized: {self._split_weights_initialized}"
+                )
+
             # Use pre-computed split weights for efficient computation
             # Ensure split weights are initialized (fallback if create_weights wasn't called)
             if not self._split_weights_initialized:
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: Initializing split weights")
                 self._initialize_split_weights()
 
             def split_gemm_nope():
+                # DEBUG: Print before fused operation attempt
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: split_gemm_nope - LLTI_AVAILABLE: {LLTI_AVAILABLE}"
+                    )
+                    print(f"DBG: split_gemm_nope - q.shape: {q.shape}")
+                    if LLTI_AVAILABLE:
+                        print(
+                            f"DBG: split_gemm_nope - attempting tk_bmm_fused_matmul"
+                        )
+
                 # Check if LLTI is available and use fused operation, otherwise fall back to standard linear
                 if LLTI_AVAILABLE and hasattr(torch.ops, 'llti') and hasattr(
                         torch.ops.llti,
@@ -1133,6 +1200,10 @@ class MLA(nn.Module):
                     # Resize BMM output buffer if needed based on current batch size
                     current_batch_size = q.shape[0]
                     if self._bmm_output_buffer.shape[1] != current_batch_size:
+                        if self.debug_print and self.config.mapping.tp_rank == 0:
+                            print(
+                                f"DBG: Resizing BMM output buffer from {self._bmm_output_buffer.shape} to match batch size {current_batch_size}"
+                            )
                         self._bmm_output_buffer = torch.empty(
                             self._bmm_weights.shape[0],
                             current_batch_size,
@@ -1140,41 +1211,70 @@ class MLA(nn.Module):
                             dtype=q.dtype,
                             device=q.device)
 
-                    if self.debug_print and self.config.mapping.tp_rank == 0:
-                        print(
-                            "================================================START==================================================",
-                            f"DBG: Calling tk_bmm_fused_matmul - q: {q.shape}, batch_size: {q.shape[0]}"
-                        )
-
                     # Update BMM weights if needed and capture BMM output for forward_generation reuse
+                    try:
+                        if self.debug_print and self.config.mapping.tp_rank == 0:
+                            print(
+                                f"DBG: Calling tk_bmm_fused_matmul - q.shape: {q.shape}, weights shape: {self._q_nope_weight_swizzled.shape}"
+                            )
 
-                    intermediate_result, _ = torch.ops.llti.tk_bmm_fused_matmul(
-                        q, self._q_nope_weight_swizzled, self._bmm_weights,
-                        self._bmm_output_buffer)
+                        intermediate_result, _ = torch.ops.llti.tk_bmm_fused_matmul(
+                            q, self._q_nope_weight_swizzled, self._bmm_weights,
+                            self._bmm_output_buffer)
 
-                    return intermediate_result
+                        if self.debug_print and self.config.mapping.tp_rank == 0:
+                            print(
+                                f"DBG: tk_bmm_fused_matmul SUCCESS - result shape: {intermediate_result.shape}"
+                            )
+
+                        return intermediate_result
+
+                    except Exception as e:
+                        if self.debug_print and self.config.mapping.tp_rank == 0:
+                            print(
+                                f"DBG: tk_bmm_fused_matmul FAILED - Error: {e}")
+                            print(f"DBG: Falling back to standard linear")
+                        # Fall back to standard linear operation
+                        return torch.nn.functional.linear(
+                            q, self._q_mixed_nope_weight, self._q_nope_bias)
 
                 else:
-                    # Fall back to standard linear operation
                     if self.debug_print and self.config.mapping.tp_rank == 0:
                         print(
-                            f"DBG: Fallback to linear (batch_size={q.shape[0]}, LLTI={LLTI_AVAILABLE})"
+                            f"DBG: Using standard linear operation (LLTI not available or conditions not met)"
                         )
+                    # Fall back to standard linear operation
                     return torch.nn.functional.linear(q,
                                                       self._q_mixed_nope_weight,
                                                       self._q_nope_bias)
 
             def split_gemm_rope():
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: split_gemm_rope - using standard linear")
                 return torch.nn.functional.linear(q, self._q_mixed_rope_weight,
                                                   self._q_rope_bias)
 
-            q_nope_mixed, q_rope_mixed = maybe_execute_in_parallel(
-                split_gemm_nope,  # Wq nope gemm using optimized mixed weights
-                split_gemm_rope,  # Wq rope gemm using optimized mixed weights
-                self.ln_events[0],
-                self.ln_events[1],
-                self.aux_stream,
-            )
+            try:
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: About to execute split GEMMs in parallel")
+
+                q_nope_mixed, q_rope_mixed = maybe_execute_in_parallel(
+                    split_gemm_nope,  # Wq nope gemm using optimized mixed weights
+                    split_gemm_rope,  # Wq rope gemm using optimized mixed weights
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    self.aux_stream,
+                )
+
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(
+                        f"DBG: Split GEMMs SUCCESS - q_nope_mixed.shape: {q_nope_mixed.shape}, q_rope_mixed.shape: {q_rope_mixed.shape}"
+                    )
+
+            except Exception as e:
+                if self.debug_print and self.config.mapping.tp_rank == 0:
+                    print(f"DBG: Split GEMMs FAILED - Error: {e}")
+                raise
 
             bmm_output = torch.empty(
                 [self.num_heads, q.shape[0], self.kv_lora_rank],
@@ -1188,89 +1288,22 @@ class MLA(nn.Module):
                 hasattr(self, 'k_b_proj_trans') and self.k_b_proj_trans
                 is not None and self.k_b_proj_trans.dtype == torch.bfloat16)
 
-            # Apply reconstruct_q_cat_from_reordered_v2 logic to create q_cat from optimized results
-            batch_size = q_nope_mixed.shape[0]
-
-            # Reconstruct the tensor that would exist just before split in the original process
-            # Use contiguous() and ensure proper memory layout to avoid CUDA memory access errors
-            pre_split_tensor = torch.empty(
-                batch_size,
-                self.num_heads,
-                self.qk_head_dim,
-                dtype=q_nope_mixed.dtype,
-                device=q_nope_mixed.device).contiguous()
-
-            # Fill in the nope part (first qk_nope_head_dim of each head)
-            # Ensure tensors are contiguous before assignment
-            q_nope_reshaped = q_nope_mixed.view(
-                batch_size, self.num_heads, self.qk_nope_head_dim).contiguous()
-            pre_split_tensor[:, :, :self.qk_nope_head_dim].copy_(
-                q_nope_reshaped)
-
-            # Fill in the rope part (last qk_rope_head_dim of each head)
-            q_rope_reshaped = q_rope_mixed.view(
-                batch_size, self.num_heads, self.qk_rope_head_dim).contiguous()
-            pre_split_tensor[:, :,
-                             self.qk_nope_head_dim:].copy_(q_rope_reshaped)
-
-            # Now flatten back to the original concat format
-            q = pre_split_tensor.view(batch_size, -1).contiguous()
-
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: Reconstructed q tensor from optimized mixed results - shape: {q.shape} stride: {q.stride()}"
-                )
-                print(
-                    f"DBG: pre_split_tensor shape: {pre_split_tensor.shape} stride: {pre_split_tensor.stride()}"
-                )
-                print(
-                    f"DBG: q_nope_reshaped shape: {q_nope_reshaped.shape} stride: {q_nope_reshaped.stride()}"
-                )
-                print(
-                    f"DBG: q_rope_reshaped shape: {q_rope_reshaped.shape} stride: {q_rope_reshaped.stride()}"
-                )
-
-            # OPTIMIZED: Use pre-computed mixed results directly instead of concat->view->split->transpose
-            q_nope = q_nope_mixed.view(q_nope_mixed.shape[0], self.num_heads,
-                                       self.qk_nope_head_dim).contiguous()
-            q_nope_t = q_nope.transpose(0, 1).contiguous()
+            q_nope_t = q_nope_mixed.view(q_nope_mixed.shape[0], self.num_heads,
+                                         self.qk_nope_head_dim).transpose(0, 1)
 
             torch.ops.trtllm.bmm_out(
                 q_nope_t,  # Wk^T
                 self.k_b_proj_trans.transpose(1, 2),
                 bmm_output)
 
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    "********************** MATMUL bmm out start *****************************"
-                )
-                # print(f"DBG: forward_impl - q_nope_t shape: {q_nope.view(q.shape[0], self.num_heads, self.qk_nope_head_dim).transpose(0, 1).shape} stride: {q_nope.view(q.shape[0], self.num_heads, self.qk_nope_head_dim).transpose(0, 1).stride()}")
-                print(
-                    f"DBG: forward_impl - q_nope_t shape and stride: {q_nope_t.shape} {q_nope_t.stride()}"
-                )
-                print(
-                    f"DBG: forward_impl - k_b_proj_trans.T shape: {self.k_b_proj_trans.transpose(1, 2).shape} stride: {self.k_b_proj_trans.transpose(1, 2).stride()}"
-                )
-                print(
-                    f"DBG: forward_impl - bmm_output shape: {bmm_output.shape} stride: {bmm_output.stride()}"
-                )
-                print(
-                    "********************** MATMUL bmm out end *****************************"
-                )
-
             if should_capture_bmm:
                 self._cached_bmm_output = bmm_output.clone().detach()
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: bmm_output values after should_capture_bmm:")
-                    print(
-                        f"DBG: bmm_output[:16, 0, 0] = {bmm_output[:16, 0, 0]}")
-                    print(
-                        f"DBG: bmm_output[0, :16, 0] = {bmm_output[0, :16, 0]}")
-                    print(
-                        f"DBG: bmm_output[0, 0, :16] = {bmm_output[0, 0, :16]}")
             # Concatenate nope and rope parts
             latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: Using standard q_b_proj path")
+
             q, latent_cache = maybe_execute_in_parallel(
                 lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
                 lambda: torch.concat([compressed_kv, k_pe], dim=-1),
@@ -1285,14 +1318,20 @@ class MLA(nn.Module):
         num_ctx_tokens = attn_metadata.num_ctx_tokens
         num_tokens = attn_metadata.num_tokens
 
-        assert q.shape[
-            0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+        if q.shape[
+                0] == 4 and self.split_q_gemm and self.use_fused_bmm_for_generation:
+            if self.debug_print and self.config.mapping.tp_rank == 0:
+                print(f"DBG: skipping assert q.shape[0] == num_tokens")
+        else:
+            assert q.shape[
+                0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print(
+                f"DBG: num_contexts: {num_contexts}, num_generations: {num_generations}, num_ctx_tokens: {num_ctx_tokens}, num_tokens: {num_tokens}"
+            )
 
         if num_contexts > 0:
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: num_contexts: {num_contexts}, num_ctx_tokens: {num_ctx_tokens}"
-                )
             q_ctx = q[:num_ctx_tokens, ...]
             compressed_kv_ctx = compressed_kv[:num_ctx_tokens, ...]
             k_pe_ctx = k_pe[:num_ctx_tokens, ...]
@@ -1314,11 +1353,11 @@ class MLA(nn.Module):
             attn_output_context = None
 
         if num_generations > 0:
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: num_generations: {num_generations}, num_ctx_tokens: {num_ctx_tokens}"
-                )
-            q_gen = q[num_ctx_tokens:, ...]
+            if q.shape[
+                    0] == 4 and self.split_q_gemm and self.use_fused_bmm_for_generation:
+                q_gen = q_rope_mixed
+            else:
+                q_gen = q[num_ctx_tokens:, ...]
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
@@ -1684,9 +1723,18 @@ class MLA(nn.Module):
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
+
         num_tokens = q.shape[0]
-        q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if self.debug_print and self.config.mapping.tp_rank == 0:
+            print(f"DBG: q.shape: {q.shape}")
+            print(f"DBG: num_tokens: {num_tokens}")
+
+        if not (q.shape[0] == 4 and self.split_q_gemm
+                and self.use_fused_bmm_for_generation):
+            q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        else:
+            q_pe = q.view(q.shape[0], self.num_heads, self.qk_rope_head_dim)
 
         # fused_q contains 1) the result of the following bmm with shape [num_tokens, num_heads, kv_lora_rank]
         # 2) rope(q_pe) with shape [num_tokens, num_heads, qk_rope_head_dim]. rope is applied inside AttentionOp
@@ -1702,10 +1750,6 @@ class MLA(nn.Module):
         if self.k_b_proj_trans.dtype == torch.bfloat16:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
-            if self.debug_print and self.config.mapping.tp_rank == 0:
-                print(
-                    f"DBG: fwd_gen - q_nope_out: {q_nope_out.shape}, q_nope_out strides: {q_nope_out.stride()}, fused_q: {fused_q.shape}, fused_q strides: {fused_q.stride()}"
-                )
 
             # FUSED BMM GENERATION: Use cached BMM output if available from tk_bmm_fused_matmul
             use_cached_bmm = (
@@ -1718,16 +1762,6 @@ class MLA(nn.Module):
                 # Use BMM output from tk_bmm_fused_matmul in forward_impl
 
                 # Copy cached BMM result to q_nope_out
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: fwd_gen - self._cached_bmm_output: {self._cached_bmm_output.shape} strides: {self._cached_bmm_output.stride()}"
-                    )
-                    print(
-                        f"DBG: fwd_gen - self._cached_bmm_output values (first 10): {self._cached_bmm_output.flatten()[:10]}"
-                    )
-                    print(
-                        f"DBG: fwd_gen - self._cached_bmm_output stats - mean: {self._cached_bmm_output.mean():.6f}, std: {self._cached_bmm_output.std():.6f}, min: {self._cached_bmm_output.min():.6f}, max: {self._cached_bmm_output.max():.6f}"
-                    )
                 # Instead of copying to the view, write directly to the underlying fused_q tensor
                 # self._cached_bmm_output shape: [num_heads, num_tokens, kv_lora_rank]
                 # fused_q[..., :kv_lora_rank] shape: [num_tokens, num_heads, kv_lora_rank]
@@ -1735,22 +1769,8 @@ class MLA(nn.Module):
                 fused_q[..., :self.
                         kv_lora_rank] = self._cached_bmm_output.transpose(0, 1)
 
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: fwd_gen - q_nope_out: {q_nope_out.shape} stride: {q_nope_out.stride()}"
-                    )
-                    print(
-                        f"DBG: fwd_gen - q_nope_out values (first 10): {q_nope_out.flatten()[:10]}"
-                    )
-                    print(
-                        f"DBG: fwd_gen - q_nope_out stats - mean: {q_nope_out.mean():.6f}, std: {q_nope_out.std():.6f}, min: {q_nope_out.min():.6f}, max: {q_nope_out.max():.6f}"
-                    )
             else:
                 # Standard BMM path: Use torch.nn.functional.linear + torch.ops.trtllm.bmm_out
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: fwd_gen - Using standard bmm_out (tokens={num_tokens}, cached={self._cached_bmm_output is not None})"
-                    )
 
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
@@ -1758,53 +1778,12 @@ class MLA(nn.Module):
                 # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
                 # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
                 # The output of bmm is written directly into fused_q
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_t: {q_nope_t.shape}, k_b_proj_trans.T: {self.k_b_proj_trans.transpose(1, 2).shape}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - k_b_proj_trans.T values (first 10): {self.k_b_proj_trans.transpose(1, 2).flatten()[:10]}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - k_b_proj_trans.T stats - mean: {self.k_b_proj_trans.transpose(1, 2).mean():.6f}, std: {self.k_b_proj_trans.transpose(1, 2).std():.6f}, min: {self.k_b_proj_trans.transpose(1, 2).min():.6f}, max: {self.k_b_proj_trans.transpose(1, 2).max():.6f}"
-                    )
-
-                    print("DBG: fwd_gen_else - k_b_proj_trans weight strides: ",
-                          self.k_b_proj_trans.transpose(1, 2).stride())
 
                 torch.ops.trtllm.bmm_out(
                     q_nope_t,  # Wk^T
                     self.k_b_proj_trans.transpose(1, 2),
                     q_nope_out)
 
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(
-                        "********************** MATMUL bmm out start *****************************"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_t shape: {q_nope_t.shape} stride: {q_nope_t.stride()}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - k_b_proj_trans.T shape: {self.k_b_proj_trans.transpose(1, 2).shape} stride: {self.k_b_proj_trans.transpose(1, 2).stride()}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_out shape: {q_nope_out.shape} stride: {q_nope_out.stride()}"
-                    )
-                    print(
-                        "********************** MATMUL bmm out end *****************************"
-                    )
-
-                if self.debug_print and self.config.mapping.tp_rank == 0:
-                    print(f"DBG: fwd_gen_else - q_nope_out: {q_nope_out.shape}")
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_out values (first 10): {q_nope_out.flatten()[:10]}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_out stats - mean: {q_nope_out.mean():.6f}, std: {q_nope_out.std():.6f}, min: {q_nope_out.min():.6f}, max: {q_nope_out.max():.6f}"
-                    )
-                    print(
-                        f"DBG: fwd_gen_else - q_nope_out strides: {q_nope_out.stride()}"
-                    )
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -1819,30 +1798,6 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
-
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(f"DBG: fwd_gen - q_nope_out: {q_nope_out.shape}")
-            print(f"DBG: fwd_gen - q_nope_out strides: {q_nope_out.stride()}")
-            print(f"DBG: fwd_gen - q_nope_out values:")
-            print("[:16, 0, 0]:", q_nope_out[:16, 0, 0])
-            print("[0, :16, 0]:", q_nope_out[0, :16, 0])
-            print("[0, 0, :16]:", q_nope_out[0, 0, :16])
-
-        if self.debug_print and self.config.mapping.tp_rank == 0:
-            print(
-                f"DBG: GENERATION - before applying rotary: fused_q.shape: {fused_q.shape}"
-            )
-            print(f"DBG: fused_q values (first 10): {fused_q.flatten()[:10]}")
-            print(
-                f"DBG: fused_q stats - mean: {fused_q.mean():.6f}, std: {fused_q.std():.6f}, min: {fused_q.min():.6f}, max: {fused_q.max():.6f}"
-            )
-            print(f"DBG: fused_q values:")
-            print("[:16, 0, 0]:", fused_q[:16, 0, 0])
-            print("[0, :16, 0]:", fused_q[0, :16, 0])
-            print("[0, 0, :16]:", fused_q[0, 0, :16])
-            print(
-                "================================================END=================================================="
-            )
 
         if self.apply_rotary_emb:
             fused_q[..., self.kv_lora_rank:] = q_pe
