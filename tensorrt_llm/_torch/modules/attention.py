@@ -1047,9 +1047,11 @@ class MLA(nn.Module):
                 self.aux_stream,
             )
 
+        # Initialize split weights if needed (regardless of batch size)
+        if self.split_q_gemm and not self._split_weights_initialized:
+            self._initialize_split_weights()
+
         if q.shape[0] == 4 and self.split_q_gemm:  #ONLY FOR M dim 4
-            if not self._split_weights_initialized:
-                self._initialize_split_weights()
 
             def split_gemm_nope():
                 self._update_bmm_weights_for_generation()
