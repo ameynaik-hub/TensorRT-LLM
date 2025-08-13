@@ -554,7 +554,7 @@ class MLA(nn.Module):
             self._bmm_output_buffer = None  # Output buffer for BMM result
 
             # Storage for BMM output from tk_bmm_fused_matmul to use in forward_generation
-            self._cached_bmm_output = None  # BMM output from fused operation for reuse
+            # self._cached_bmm_output = None  # BMM output from fused operation for reuse
             self._bmm_weights_updated = False  # Track if BMM weights have been updated
 
         if self.q_lora_rank is None:
@@ -1056,33 +1056,22 @@ class MLA(nn.Module):
             def split_gemm_nope():
                 self._update_bmm_weights_for_generation()
 
-                # Check if LLTI is available and use fused operation, otherwise fall back to standard linear
-                if LLTI_AVAILABLE and hasattr(torch.ops, 'llti') and hasattr(
-                        torch.ops.llti,
-                        'tk_bmm_fused_matmul') and q.shape[0] == 4:
+                current_batch_size = q.shape[0]
+                if self._bmm_output_buffer.shape[1] != current_batch_size:
+                    self._bmm_output_buffer = torch.empty(
+                        self._bmm_weights.shape[0],
+                        current_batch_size,
+                        self._bmm_weights.shape[2],
+                        dtype=q.dtype,
+                        device=q.device)
 
-                    # Resize BMM output buffer if needed based on current batch size
-                    current_batch_size = q.shape[0]
-                    if self._bmm_output_buffer.shape[1] != current_batch_size:
-                        self._bmm_output_buffer = torch.empty(
-                            self._bmm_weights.shape[0],
-                            current_batch_size,
-                            self._bmm_weights.shape[2],
-                            dtype=q.dtype,
-                            device=q.device)
+                intermediate_result, _ = torch.ops.llti.tk_bmm_fused_matmul(
+                    q, self._q_nope_weight_swizzled, self._bmm_weights,
+                    self._bmm_output_buffer)
 
-                    intermediate_result, bmm_out1 = torch.ops.llti.tk_bmm_fused_matmul(
-                        q, self._q_nope_weight_swizzled, self._bmm_weights,
-                        self._bmm_output_buffer)
+                latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
-                    self._cached_bmm_output = bmm_out1.clone().detach()
-
-                    return intermediate_result
-
-                else:
-                    return torch.nn.functional.linear(q,
-                                                      self._q_mixed_nope_weight,
-                                                      self._q_nope_bias)
+                return latent_cache
 
             def split_gemm_rope():
                 return torch.nn.functional.linear(q, self._q_mixed_rope_weight,
@@ -1090,7 +1079,7 @@ class MLA(nn.Module):
 
             try:
 
-                q_nope_mixed, q_rope_mixed = maybe_execute_in_parallel(
+                latent_cache, q_rope_mixed = maybe_execute_in_parallel(
                     split_gemm_nope,  # Wq nope gemm using optimized mixed weights
                     split_gemm_rope,  # Wq rope gemm using optimized mixed weights
                     self.ln_events[0],
@@ -1100,8 +1089,6 @@ class MLA(nn.Module):
 
             except Exception:
                 raise
-
-            latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
         else:
 
             q, latent_cache = maybe_execute_in_parallel(
@@ -1539,24 +1526,28 @@ class MLA(nn.Module):
         )
 
         if self.k_b_proj_trans.dtype == torch.bfloat16:
-            # [num_heads, num_tokens, self.kv_lora_rank]
-            q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
             # FUSED BMM GENERATION: Use cached BMM output if available from tk_bmm_fused_matmul
+            # use_cached_bmm = (
+            #     self.use_fused_bmm_for_generation
+            #     and self._cached_bmm_output is not None and num_tokens ==
+            #     4  # Only when batch size is 4 (matching forward_impl condition)
+            # )
+
             use_cached_bmm = (
-                self.use_fused_bmm_for_generation
-                and self._cached_bmm_output is not None and num_tokens ==
+                self.use_fused_bmm_for_generation and num_tokens ==
                 4  # Only when batch size is 4 (matching forward_impl condition)
             )
 
             if use_cached_bmm:
 
                 fused_q[..., :self.
-                        kv_lora_rank] = self._cached_bmm_output.transpose(0, 1)
+                        kv_lora_rank] = self._bmm_output_buffer.transpose(0, 1)
 
             else:
                 # Standard BMM path: Use torch.nn.functional.linear + torch.ops.trtllm.bmm_out
-
+                # [num_heads, num_tokens, self.kv_lora_rank]
+                q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
                 # [num_heads, num_tokens, self.qk_nope_head_dim]
                 q_nope_t = q_nope.transpose(0, 1)
 
