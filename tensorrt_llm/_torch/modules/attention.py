@@ -841,8 +841,16 @@ class MLA(nn.Module):
         if LLTI_AVAILABLE:
             self._q_nope_weight_swizzled = swizzle_b_matrix(
                 self._q_mixed_nope_weight.t().contiguous(), 4, 8).detach()
+
+            # For transposed GEMM optimization, we need both matrices in K-major format
+            # Instead of runtime conversion, let's go back to the standard approach  
+            # and avoid the transpose optimization to eliminate extra kernel launches
+            # Store weight in the format expected by standard cute GEMM
+            weight_temp = self._q_mixed_rope_weight.T.contiguous()  # [1536, 1024] 
+            self._q_mixed_rope_weight_cute = weight_temp.t().contiguous().t().detach()  # [1024, 1536] K-major
         else:
             self._q_nope_weight_swizzled = None
+            self._q_mixed_rope_weight_cute = None
 
         # Split bias if present
         if self.q_b_proj.bias is not None:
@@ -1069,19 +1077,55 @@ class MLA(nn.Module):
                     q, self._q_nope_weight_swizzled, self._bmm_weights,
                     self._bmm_output_buffer)
 
-                latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-
-                return latent_cache
+                # latent_cache creation moved to split_gemm_rope stream for better load balancing
+                return None  # No return value needed from this stream
 
             def split_gemm_rope():
-                return torch.nn.functional.linear(q, self._q_mixed_rope_weight,
-                                                  self._q_rope_bias)
+                # Create latent_cache in parallel with rope computation for better load balancing
+                
+
+                if LLTI_AVAILABLE and hasattr(
+                        self, '_q_mixed_rope_weight_cute'
+                ) and self._q_mixed_rope_weight_cute is not None:
+                    # ZERO-COPY transpose optimization using PyTorch .T (view-only operations)
+                    # Mathematical identity: A @ B^T = (B @ A^T)^T
+                    # weight[1024, 1536] @ q^T[1536, 4] = (q[4, 1536] @ weight^T[1536, 1024])^T
+                    
+                    # Test if .T creates views (no copy) for both matrices
+                    # q.T: [4, 1536] -> [1536, 4] (should be a view)
+                    # weight.T: [1024, 1536] -> [1536, 1024] (should be a view)  
+                    result_transposed = torch.ops.llti.cute_gemm_bf16(
+                        self._q_mixed_rope_weight_cute.T,  # [1536, 1024] - view operation
+                        q.T,                               # [1536, 4] - view operation
+                        None,  # C: let cute GEMM create output
+                        None,  # bias: handle separately due to different convention
+                        True,  # fdl: fast descriptor loading
+                        4,  # fdl_count: default
+                        8  # dma_stage: default
+                    )
+                    
+                    # Final transpose back: [1024, 4] -> [4, 1024] (view operation)
+                    result = result_transposed.T
+                    
+                    # Add bias manually since cute GEMM has different bias convention
+                    if self._q_rope_bias is not None:
+                        result = result + self._q_rope_bias
+                    # Ensure contiguous layout for downstream TensorRT-LLM operations
+                    # TensorRT-LLM attention expects stride()[last_dim] == 1
+                    rope_result = result.contiguous()
+                else:
+                    # Fallback to standard linear implementation
+                    rope_result = torch.nn.functional.linear(
+                        q, self._q_mixed_rope_weight, self._q_rope_bias)
+
+                latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+                return latent_cache, rope_result
 
             try:
 
-                latent_cache, q_rope_mixed = maybe_execute_in_parallel(
-                    split_gemm_nope,  # Wq nope gemm using optimized mixed weights
-                    split_gemm_rope,  # Wq rope gemm using optimized mixed weights
+                _, (latent_cache, q_rope_mixed) = maybe_execute_in_parallel(
+                    split_gemm_nope,  # Wq nope gemm (BMM fusion only)
+                    split_gemm_rope,  # Wq rope gemm + latent_cache creation for better load balancing
                     self.ln_events[0],
                     self.ln_events[1],
                     self.aux_stream,
