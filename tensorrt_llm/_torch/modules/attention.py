@@ -31,7 +31,7 @@ from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, get_model_extra_attrs
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-from .multi_stream_utils import maybe_execute_in_parallel
+from .multi_stream_utils import maybe_execute_in_parallel, maybe_execute_in_parallel_3streams
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
 
@@ -482,6 +482,7 @@ class MLA(nn.Module):
             max_position_embeddings: int,
             bias: bool,
             aux_stream: Optional[torch.cuda.Stream] = None,
+            concat_stream: Optional[torch.cuda.Stream] = None,
             pos_embd_params: Optional[PositionalEmbeddingParams] = None,
             layer_idx: Optional[int] = None,
             dtype: torch.dtype = None,
@@ -507,6 +508,7 @@ class MLA(nn.Module):
             max_position_embeddings (int): The maximum position embeddings.
             bias (bool): Whether to use bias in the linear layers.
             aux_stream (Optional[torch.cuda.Stream]): The auxiliary CUDA stream for running operations in two parallel streams.
+            concat_stream (Optional[torch.cuda.Stream]): The CUDA stream specifically for concat operations to overlap with computation.
             pos_embd_params (PositionalEmbeddingParams): The positional embedding parameters.
             layer_idx (int): The layer index.
             dtype (torch.dtype): The data type.
@@ -741,7 +743,8 @@ class MLA(nn.Module):
         )
 
         self.aux_stream = aux_stream
-        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        self.concat_stream = concat_stream
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event(), torch.cuda.Event()]  # Added 3rd event for concat
 
         self.rope_fusion = self.mha.support_fused_rope()
         self.support_fused_qkv = self.mha.support_fused_qkv()
@@ -1077,13 +1080,11 @@ class MLA(nn.Module):
                     q, self._q_nope_weight_swizzled, self._bmm_weights,
                     self._bmm_output_buffer)
 
-                # latent_cache creation moved to split_gemm_rope stream for better load balancing
+                # Pure nope GEMM with BMM fusion (concat is now on stream 3)
                 return None  # No return value needed from this stream
 
             def split_gemm_rope():
-                # Create latent_cache in parallel with rope computation for better load balancing
-                
-
+                # Pure rope GEMM computation (no concat - that's on stream 3)
                 if LLTI_AVAILABLE and hasattr(
                         self, '_q_mixed_rope_weight_cute'
                 ) and self._q_mixed_rope_weight_cute is not None:
@@ -1118,23 +1119,33 @@ class MLA(nn.Module):
                     rope_result = torch.nn.functional.linear(
                         q, self._q_mixed_rope_weight, self._q_rope_bias)
 
-                latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
-                return latent_cache, rope_result
+                return rope_result
 
+            def split_concat():
+                # Pure concat operation for stream 3
+                return torch.concat([compressed_kv, k_pe], dim=-1)
+            
             try:
 
-                _, (latent_cache, q_rope_mixed) = maybe_execute_in_parallel(
-                    split_gemm_nope,  # Wq nope gemm (BMM fusion only)
-                    split_gemm_rope,  # Wq rope gemm + latent_cache creation for better load balancing
-                    self.ln_events[0],
-                    self.ln_events[1],
-                    self.aux_stream,
+                # # Run all 3 operations in parallel on separate streams
+                _, q_rope_mixed, latent_cache = maybe_execute_in_parallel_3streams(
+                    split_gemm_nope,  # Stream 1 (default): Wq nope GEMM (BMM fusion only)
+                    split_gemm_rope,  # Stream 2 (aux_stream): Wq rope GEMM (pure GEMM)
+                    split_concat,     # Stream 3 (concat_stream): concat operation
+                    self.ln_events[0],  # Event for stream 1
+                    self.ln_events[1],  # Event for stream 2  
+                    self.ln_events[2],  # Event for stream 3
+                    self.aux_stream,    # aux_stream1 for rope GEMM
+                    self.concat_stream, # aux_stream2 for concat
                 )
+                # _ = split_gemm_nope()
+                # q_rope_mixed = split_gemm_rope()
+                # latent_cache = split_concat()
 
             except Exception:
                 raise
         else:
-
+            # Fallback to 2-stream execution when split_q_gemm is disabled
             q, latent_cache = maybe_execute_in_parallel(
                 lambda: self.q_b_proj(q),  #Wq gemm + Wqr gemm
                 lambda: torch.concat([compressed_kv, k_pe], dim=-1),

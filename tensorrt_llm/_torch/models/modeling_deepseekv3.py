@@ -228,6 +228,7 @@ class DeepseekV3Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        concat_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
@@ -250,7 +251,8 @@ class DeepseekV3Attention(MLA):
                          layer_idx=layer_idx,
                          dtype=config.torch_dtype,
                          config=model_config,
-                         aux_stream=aux_stream)
+                         aux_stream=aux_stream,
+                         concat_stream=concat_stream)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
@@ -612,7 +614,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.self_attn = DeepseekV3Attention(
             model_config,
             layer_idx=layer_idx,
-            aux_stream=aux_stream_dict[AuxStreamType.Attention])
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
+            concat_stream=aux_stream_dict[AuxStreamType.ConcatOperation])
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
@@ -1049,11 +1052,12 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.ConcatOperation: aux_stream_list[2],
         }
 
         self.embed_tokens = Embedding(
