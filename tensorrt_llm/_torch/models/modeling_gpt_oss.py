@@ -36,6 +36,7 @@ from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
+import tinygemm2
 
 class AttentionBlock(Attention):
 
@@ -228,7 +229,9 @@ class MLPBlock(torch.nn.Module):
         # t = self.norm(x) was done in the parent block
         t = x
 
-        g = self.gate(t)
+        # g = self.gate(t)
+        # print("running tinygemm2 on router gemm")
+        g = tinygemm2.forward(t, self.gate.weight, self.gate.bias)
         # Use ideal load balanced logits if enabled, otherwise use gate output
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing
@@ -258,6 +261,7 @@ class MLPBlock(torch.nn.Module):
 
         # Get attention_dp parameters
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
 
         if self.mapping.tp_size > 1 and all_rank_num_tokens is not None:
             if (isinstance(self.experts, (TRTLLMGenFusedMoE, TritonFusedMoE))):
@@ -407,7 +411,7 @@ class TransformerBlock(DecoderLayer):
             x = self.allreduce(x,
                                all_reduce_params=AllReduceParams(
                                    fusion_op=AllReduceFusionOp.NONE,
-                                   trigger_completion_at_end=False,
+                                   trigger_completion_at_end=True, #False,
                                ))
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
                                                       residual)
@@ -420,7 +424,7 @@ class TransformerBlock(DecoderLayer):
                     residual=residual,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
-                    trigger_completion_at_end=False,
+                    trigger_completion_at_end=True, #False,
                 ))
 
         return x, residual

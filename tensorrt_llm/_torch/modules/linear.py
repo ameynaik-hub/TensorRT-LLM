@@ -6,6 +6,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
+from llti.ops.comms import allgather_llti, allgather_llti_lamport
 
 import torch
 import torch.nn.functional as F
@@ -25,6 +26,10 @@ from ..._utils import is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
+from flashinfer import (
+    tgv_gemm_sm100,
+)
+#from llti.ops.comms import AllGatherLLTILamport
 
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
@@ -1856,6 +1861,11 @@ class Linear(nn.Module):
 
         if not skip_create_weights_in_init:
             self.create_weights()
+        
+        from llti.utils import init_dist_env
+
+        if not torch.distributed.is_initialized():
+            init_dist_env()
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
@@ -1935,8 +1945,18 @@ class Linear(nn.Module):
                      input,
                      bias,
                      lora_params: Optional[dict] | None = None,
-                     layer_idx: Optional[int] | None = None):
-        output = self.quant_method.apply(self, input, bias)
+                     layer_idx: Optional[int] | None = None,
+                     use_tgv: bool = False):
+                         
+        if use_tgv:
+            # print("running tgv gemm")
+          #  print(f"input.shape: {input.shape}, self.weight.t().shape: {self.weight.t().shape}")
+            output = tgv_gemm_sm100(input, self.weight.t(), bias, pdl=True)
+          #  output = bf16_tgv_gemm_sm100(input, self.weight.t(), bias, pdl=False)
+        else:
+            output = self.quant_method.apply(self, input, bias)                 
+                         
+       # output = self.quant_method.apply(self, input, bias)
 
         if self.lora is not None and bool(lora_params):
             lora_result = self.lora(input, lora_params, layer_idx)
@@ -1968,6 +1988,7 @@ class Linear(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
+        use_tgv: bool = True,
     ) -> torch.Tensor:
         if self.tp_mode == TensorParallelMode.ROW:
             bias = None if (self.tp_rank > 0) else self.bias
@@ -1975,20 +1996,26 @@ class Linear(nn.Module):
                 fuse_bias = self._maybe_fuse_bias_into_allreduce(
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
-                output = self.apply_linear(input, bias, lora_params, layer_idx)
+                output = self.apply_linear(input, bias, lora_params, layer_idx, use_tgv=use_tgv)
                 output = self.all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
             else:
-                output = self.apply_linear(input, bias, lora_params, layer_idx)
+                output = self.apply_linear(input, bias, lora_params, layer_idx, use_tgv=use_tgv)
         elif self.tp_mode == TensorParallelMode.COLUMN:
-            output = self.apply_linear(input, self.bias, lora_params, layer_idx)
+            output = self.apply_linear(input, self.bias, lora_params, layer_idx, use_tgv=use_tgv)
             if self.gather_output:
                 from ..distributed import allgather
+                #    # print(f"output buffer shape before allgather: {output.shape}")
+                # output = allgather_llti_lamport(output)
+                # print(f"output.numel(): {output.numel()}, self.mapping.tp_size: {self.mapping.tp_size}")
+                # allgather_op = AllGatherLLTILamport(output.numel() * self.mapping.tp_size, output.dtype)
                 output = allgather(output, self.mapping)
+
+            #    print(f"output buffer shape after allgather: {output.shape}")
         else:
-            output = self.apply_linear(input, self.bias, lora_params, layer_idx)
+            output = self.apply_linear(input, self.bias, lora_params, layer_idx, use_tgv=use_tgv)
 
         return output
 
