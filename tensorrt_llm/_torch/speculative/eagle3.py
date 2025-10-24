@@ -363,7 +363,6 @@ class Eagle3OneModelWorker(nn.Module):
                                                   attn_metadata, True)
             if self.guided_decoder is not None:
                 d2t = getattr(draft_model.model, "d2t", None)
-                @torch.compile(options={"max-autotune": True})
                 self.guided_decoder.execute_draft_batch(logits,
                                                         d2t,
                                                         draft_step=i)

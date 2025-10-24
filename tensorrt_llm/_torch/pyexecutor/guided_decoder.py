@@ -522,6 +522,7 @@ class CapturableGuidedDecoder(GuidedDecoder):
             else:
                 assert req.is_draft
 
+    # invoking a copy kernel here
     def execute_draft_batch(self,
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,

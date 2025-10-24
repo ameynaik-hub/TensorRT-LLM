@@ -411,7 +411,7 @@ class TransformerBlock(DecoderLayer):
             x = self.allreduce(x,
                                all_reduce_params=AllReduceParams(
                                    fusion_op=AllReduceFusionOp.NONE,
-                                   trigger_completion_at_end=True, #False,
+                                   trigger_completion_at_end=False,
                                ))
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, x,
                                                       residual)
@@ -424,7 +424,7 @@ class TransformerBlock(DecoderLayer):
                     residual=residual,
                     norm_weight=self.next_layer_layernorm.weight,
                     eps=self.next_layer_layernorm.variance_epsilon,
-                    trigger_completion_at_end=True, #False,
+                    trigger_completion_at_end=False,
                 ))
 
         return x, residual

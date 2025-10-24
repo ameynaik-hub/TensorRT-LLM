@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 from llti.ops.comms import allgather_llti, allgather_llti_lamport
+from llti.ops.comms import llti_init_lamport_workspace
 
 import torch
 import torch.nn.functional as F
@@ -1866,6 +1867,12 @@ class Linear(nn.Module):
 
         if not torch.distributed.is_initialized():
             init_dist_env()
+        
+        llti_init_lamport_workspace(16*1024**2)
+        
+         # Add dummy allgather operation after dist env init
+        # dummy = torch.randn(128, dtype=torch.float16, device=f"cuda:{self.tp_rank}")
+        # _ = allgather_llti_lamport(dummy)
 
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
         return get_quant_method(quant_config)
@@ -2006,12 +2013,12 @@ class Linear(nn.Module):
         elif self.tp_mode == TensorParallelMode.COLUMN:
             output = self.apply_linear(input, self.bias, lora_params, layer_idx, use_tgv=use_tgv)
             if self.gather_output:
-                from ..distributed import allgather
+                # from ..distributed import allgather
                 #    # print(f"output buffer shape before allgather: {output.shape}")
-                # output = allgather_llti_lamport(output)
+                output = allgather_llti_lamport(output)
                 # print(f"output.numel(): {output.numel()}, self.mapping.tp_size: {self.mapping.tp_size}")
                 # allgather_op = AllGatherLLTILamport(output.numel() * self.mapping.tp_size, output.dtype)
-                output = allgather(output, self.mapping)
+                # output = allgather(output, self.mapping)
 
             #    print(f"output buffer shape after allgather: {output.shape}")
         else:

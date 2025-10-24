@@ -49,6 +49,10 @@ class Eagle3Attention(Attention):
         tp_size = model_config.mapping.tp_size
         # Override the QKV projection. The number of input features
         # is twice as big for EAGLE3 draft models.
+        # print(f"tp_size: {tp_size}")
+        # print(f"self.hidden_size: {self.hidden_size}")
+        # print(f"self.q_size: {self.q_size}")
+        # print(f"self.kv_size: {self.kv_size}")
         self.qkv_proj = Linear(
             2 * self.hidden_size,
             tp_size * self.q_size + 2 * tp_size * self.kv_size,
@@ -62,6 +66,7 @@ class Eagle3Attention(Attention):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
         )
+        # print(f"self.qkv_proj.weight.shape: {self.qkv_proj.weight.shape}")
 
 
 class Eagle3DecoderLayer(DecoderLayer):
@@ -219,7 +224,9 @@ class Eagle3DraftModel(DecoderModel):
         # avoid data-dependent control flow and gives us better CUDA graph
         # coverage.
         residual = None
+        # print(f"self.num_layers: {self.num_layers}")
         if self.num_layers > 1:
+            # print(f"self.midlayer: {self.midlayer}")
             for layer in self.midlayer:
                 if residual is not None:
                     hidden_states = hidden_states + residual
@@ -229,6 +236,7 @@ class Eagle3DraftModel(DecoderModel):
                                                 attn_metadata=attn_metadata,
                                                 spec_metadata=spec_metadata)
         else:
+            # print(f"self.midlayer: {self.midlayer}")
             hidden_states, residual = self.midlayer(position_ids=position_ids,
                                                     embeds=inputs_embeds,
                                                     hidden_states=hidden_states,
